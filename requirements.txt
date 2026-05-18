@@ -1,0 +1,6 @@
+gymnasium==1.1.1
+torch
+wandb==0.26
+mujoco>=3.0
+tqdm
+numpy
