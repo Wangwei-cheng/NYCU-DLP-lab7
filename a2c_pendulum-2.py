@@ -33,14 +33,30 @@ class Actor(nn.Module):
         
         ############TODO#############
         # Remeber to initialize the layer weights
-        
+        self.fc1 = nn.Linear(in_dim, 128)
+        self.fc2 = nn.Linear(128, 128)
+        self.mu_layer = nn.Linear(128, out_dim)
+        self.log_std_layer = nn.Linear(128, out_dim)
+
+        initialize_uniformly(self.fc1)
+        initialize_uniformly(self.fc2)
+        initialize_uniformly(self.mu_layer)
+        initialize_uniformly(self.log_std_layer)
         #############################
         
-    def forward(self, state: torch.Tensor) -> torch.Tensor:
+    def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, Normal]:
         """Forward method implementation."""
 
         ############TODO#############
-
+        x = F.relu(self.fc1(state))
+        x = F.relu(self.fc2(x))
+        
+        mu = torch.tanh(self.mu_layer(x)) * 2.0
+        log_std = self.log_std_layer(x)
+        std = torch.exp(log_std)
+        
+        dist = Normal(mu, std)
+        action = dist.sample()
         #############################
 
         return action, dist
@@ -53,14 +69,22 @@ class Critic(nn.Module):
         
         ############TODO#############
         # Remeber to initialize the layer weights
-        
+        self.fc1 = nn.Linear(in_dim, 128)
+        self.fc2 = nn.Linear(128, 128)
+        self.value_layer = nn.Linear(128, 1)
+
+        initialize_uniformly(self.fc1)
+        initialize_uniformly(self.fc2)
+        initialize_uniformly(self.value_layer)
         #############################
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         """Forward method implementation."""
         
         ############TODO#############
-
+        x = F.relu(self.fc1(state))
+        x = F.relu(self.fc2(x))
+        value = self.value_layer(x)
         #############################
 
         return value
@@ -149,6 +173,12 @@ class A2CAgent:
         
         ############TODO#############
         # value_loss = ?
+        next_state_tensor = torch.FloatTensor(next_state).to(self.device)
+        next_value = self.critic(next_state_tensor)
+        target = reward + self.gamma * next_value * mask
+        
+        current_value = self.critic(state)
+        value_loss = F.mse_loss(current_value, target.detach())
         #############################
 
         # update value
@@ -159,6 +189,13 @@ class A2CAgent:
         # advantage = Q_t - V(s_t)
         ############TODO#############
         # policy_loss = ?
+        advantage = target.detach() - current_value.detach()
+        
+        # Calculate entropy for exploration
+        _, dist = self.actor(state)
+        entropy = dist.entropy().sum(-1)
+        
+        policy_loss = - (log_prob * advantage + self.entropy_weight * entropy)
         #############################
         # update policy
         self.actor_optimizer.zero_grad()
