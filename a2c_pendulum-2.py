@@ -215,9 +215,25 @@ class A2CAgent:
         """Train the agent."""
         self.is_test = False
         step_count = 0
-        
+        best_score = -float('inf')
+
+        # Initial entropy weight
+        init_entropy_weight = self.entropy_weight
+
         state, _ = self.env.reset(seed=self.seed)
         for ep in tqdm(range(1, self.num_episodes)):
+            # Linear decay for learning rate
+            frac = 1.0 - (ep - 1.0) / self.num_episodes
+            new_actor_lr = self.actor_lr * frac
+            new_critic_lr = self.critic_lr * frac
+            for param_group in self.actor_optimizer.param_groups:
+                param_group['lr'] = new_actor_lr
+            for param_group in self.critic_optimizer.param_groups:
+                param_group['lr'] = new_critic_lr
+
+            # Linear decay for entropy weight
+            self.entropy_weight = init_entropy_weight * frac
+
             actor_losses, critic_losses, scores = [], [], []
             if ep > 1:
                 state, _ = self.env.reset()
@@ -240,16 +256,42 @@ class A2CAgent:
                     "step": step_count,
                     "actor loss": actor_loss,
                     "critic loss": critic_loss,
+                    "actor_lr": new_actor_lr,
+                    "entropy_weight": self.entropy_weight
                     }) 
                 # if episode ends
                 if done:
-                    scores.append(score)
                     print(f"Episode {ep}: Total Reward = {score}")
                     # W&B logging
                     wandb.log({
                         "episode": ep,
                         "return": score
-                        })  
+                        })
+            # Evaluation every 20 episodes
+            if ep % 20 == 0:
+                eval_score = self.evaluate()
+                wandb.log({"eval_return": eval_score})
+                print(f"--- Evaluation at Episode {ep}: Average Reward = {eval_score} ---")
+                if eval_score > best_score:
+                    best_score = eval_score
+                    torch.save(self.actor.state_dict(), "a2c_actor_best.pt")
+                    torch.save(self.critic.state_dict(), "a2c_critic_best.pt")
+                    print(f"New Best Model Saved! Score: {best_score}")
+
+    def evaluate(self, n_episodes=20):
+        """Evaluate the agent for n_episodes."""
+        self.is_test = True
+        total_reward = 0
+        for _ in range(n_episodes):
+            state, _ = self.env.reset()
+            done = False
+            while not done:
+                action = self.select_action(state)
+                next_state, reward, done = self.step(action)
+                state = next_state
+                total_reward += reward
+        self.is_test = False
+        return total_reward / n_episodes
 
     def test(self, video_folder: str):
         """Test the agent."""
