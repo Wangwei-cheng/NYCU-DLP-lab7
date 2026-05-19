@@ -1,1 +1,1 @@
-python a2c_pendulum-2.py
+python a2c_pendulum-2.py --actor-lr 3e-4 --num-episodes 1000

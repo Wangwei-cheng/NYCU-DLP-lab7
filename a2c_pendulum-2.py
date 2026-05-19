@@ -33,10 +33,10 @@ class Actor(nn.Module):
         
         ############TODO#############
         # Remeber to initialize the layer weights
-        self.fc1 = nn.Linear(in_dim, 128)
-        self.fc2 = nn.Linear(128, 128)
-        self.mu_layer = nn.Linear(128, out_dim)
-        self.log_std_layer = nn.Linear(128, out_dim)
+        self.fc1 = nn.Linear(in_dim, 256)
+        self.fc2 = nn.Linear(256, 512)
+        self.mu_layer = nn.Linear(512, out_dim)
+        self.log_std_layer = nn.Linear(512, out_dim)
 
         initialize_uniformly(self.fc1)
         initialize_uniformly(self.fc2)
@@ -69,9 +69,9 @@ class Critic(nn.Module):
         
         ############TODO#############
         # Remeber to initialize the layer weights
-        self.fc1 = nn.Linear(in_dim, 128)
-        self.fc2 = nn.Linear(128, 128)
-        self.value_layer = nn.Linear(128, 1)
+        self.fc1 = nn.Linear(in_dim, 256)
+        self.fc2 = nn.Linear(256, 512)
+        self.value_layer = nn.Linear(512, 1)
 
         initialize_uniformly(self.fc1)
         initialize_uniformly(self.fc2)
@@ -159,7 +159,9 @@ class A2CAgent:
         done = terminated or truncated
 
         if not self.is_test:
-            self.transition.extend([next_state, reward, done])
+            # Reward scaling for better stability in Pendulum
+            scaled_reward = reward / 10.0
+            self.transition.extend([next_state, scaled_reward, done])
 
         return next_state, reward, done
 
@@ -184,6 +186,7 @@ class A2CAgent:
         # update value
         self.critic_optimizer.zero_grad()
         value_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
         self.critic_optimizer.step()
 
         # advantage = Q_t - V(s_t)
@@ -200,6 +203,7 @@ class A2CAgent:
         # update policy
         self.actor_optimizer.zero_grad()
         policy_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
         self.actor_optimizer.step()
 
         return policy_loss.item(), value_loss.item()

@@ -27,5 +27,7 @@ RUN pip install --no-cache-dir torch torchvision torchaudio
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+COPY . .
+
 # 預設指令
 CMD ["/bin/bash"]
