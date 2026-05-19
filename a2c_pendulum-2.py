@@ -53,7 +53,10 @@ class Actor(nn.Module):
         
         mu = torch.tanh(self.mu_layer(x)) * 2.0
         log_std = self.log_std_layer(x)
-        std = torch.exp(log_std)
+        
+        # Clamp log_std to prevent NaN and ensure numerical stability
+        log_std = torch.clamp(log_std, min=-20, max=2)
+        std = torch.exp(log_std) + 1e-5
         
         dist = Normal(mu, std)
         action = dist.sample()
