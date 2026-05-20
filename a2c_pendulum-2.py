@@ -17,6 +17,8 @@ import torch.optim as optim
 from torch.distributions import Normal
 import argparse
 import wandb
+import os
+import shutil
 from tqdm import tqdm
 from typing import Tuple
 
@@ -120,6 +122,7 @@ class A2CAgent:
         self.actor_lr = args.actor_lr
         self.critic_lr = args.critic_lr
         self.num_episodes = args.num_episodes
+        self.ckpt_dir = args.ckpt_dir
         
         # device: cpu / gpu
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -215,6 +218,7 @@ class A2CAgent:
         """Train the agent."""
         self.is_test = False
         step_count = 0
+        last_ckpt_step = 0
         best_score = -float('inf')
 
         # Initial entropy weight
@@ -274,9 +278,20 @@ class A2CAgent:
                 print(f"--- Evaluation at Episode {ep}: Average Reward = {eval_score} ---")
                 if eval_score > best_score:
                     best_score = eval_score
-                    torch.save(self.actor.state_dict(), "a2c_actor_best.pt")
-                    torch.save(self.critic.state_dict(), "a2c_critic_best.pt")
+                    torch.save(self.actor.state_dict(), os.path.join(self.ckpt_dir, "a2c_actor_best.pt"))
+                    torch.save(self.critic.state_dict(), os.path.join(self.ckpt_dir, "a2c_critic_best.pt"))
                     print(f"New Best Model Saved! Score: {best_score}")
+
+            # Check for 50k step checkpoint
+            if step_count // 50000 > last_ckpt_step // 50000:
+                last_ckpt_step = (step_count // 50000) * 50000
+                suffix = f"{last_ckpt_step // 1000}k"
+                best_actor_path = os.path.join(self.ckpt_dir, "a2c_actor_best.pt")
+                best_critic_path = os.path.join(self.ckpt_dir, "a2c_critic_best.pt")
+                if os.path.exists(best_actor_path) and os.path.exists(best_critic_path):
+                    shutil.copy(best_actor_path, os.path.join(self.ckpt_dir, f"a2c_actor_{suffix}.pt"))
+                    shutil.copy(best_critic_path, os.path.join(self.ckpt_dir, f"a2c_critic_{suffix}.pt"))
+                    print(f"Saved copy of best model at {suffix} steps.")
 
     def evaluate(self, n_episodes=20):
         """Evaluate the agent for n_episodes."""
@@ -300,18 +315,23 @@ class A2CAgent:
         tmp_env = self.env
         self.env = gym.wrappers.RecordVideo(self.env, video_folder=video_folder)
 
-        state, _ = self.env.reset(seed=self.seed)
-        done = False
-        score = 0
+        scores = []
+        for i in range(20):
+            state, _ = self.env.reset(seed=i)
+            done = False
+            score = 0
 
-        while not done:
-            action = self.select_action(state)
-            next_state, reward, done = self.step(action)
+            while not done:
+                action = self.select_action(state)
+                next_state, reward, done = self.step(action)
 
-            state = next_state
-            score += reward
+                state = next_state
+                score += reward
+            
+            scores.append(score)
+            print(f"Episode {i}: score = {score}")
 
-        print("score: ", score)
+        print("Average score: ", np.mean(scores))
         self.env.close()
 
         self.env = tmp_env
@@ -333,6 +353,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-episodes", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=77)
     parser.add_argument("--entropy-weight", type=float, default=1e-2) # entropy can be disabled by setting this to 0
+    parser.add_argument("--ckpt_dir", type=str, default="./checkpoints")
     args = parser.parse_args()
     
     # environment

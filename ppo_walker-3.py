@@ -312,18 +312,23 @@ class PPOAgent:
         tmp_env = self.env
         self.env = gym.wrappers.RecordVideo(self.env, video_folder=video_folder)
 
-        state, _ = self.env.reset(seed=self.seed)
-        done = False
-        score = 0
+        scores = []
+        for i in range(20):
+            state, _ = self.env.reset(seed=i)
+            done = False
+            score = 0
 
-        while not done:
-            action = self.select_action(state)
-            next_state, reward, done = self.step(action)
+            while not done:
+                action = self.select_action(state)
+                next_state, reward, done = self.step(action)
 
-            state = next_state
-            score += reward
+                state = next_state
+                score += reward
+            
+            scores.append(score)
+            print(f"Episode {i}: score = {score}")
 
-        print("score: ", score)
+        print("Average score: ", np.mean(scores))
         self.env.close()
 
         self.env = tmp_env
