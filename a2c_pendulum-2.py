@@ -123,6 +123,7 @@ class A2CAgent:
         self.critic_lr = args.critic_lr
         self.num_episodes = args.num_episodes
         self.ckpt_dir = args.ckpt_dir
+        self.n_step = args.n_step
 
         if not os.path.exists(self.ckpt_dir):
             os.makedirs(self.ckpt_dir)
@@ -143,6 +144,7 @@ class A2CAgent:
 
         # transition (state, log_prob, next_state, reward, done)
         self.transition: list = list()
+        self.transitions: list = list()
 
         # total steps count
         self.total_step = 0
@@ -174,47 +176,57 @@ class A2CAgent:
 
         return next_state, reward, done
 
-    def update_model(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Update the model by gradient descent."""
-        state, log_prob, next_state, reward, done = self.transition
-
-        # Q_t   = r + gamma * V(s_{t+1})  if state != Terminal
-        #       = r                       otherwise
-        mask = 1 - done
+    def update_model(self, next_state, done) -> Tuple[float, float]:
+        """Update the model by gradient descent using N-step returns."""
         
-        ############TODO#############
-        # value_loss = ?
+        # Calculate bootstrap value
         next_state_tensor = torch.FloatTensor(next_state).to(self.device)
-        next_value = self.critic(next_state_tensor)
-        target = reward + self.gamma * next_value * mask
+        next_value = self.critic(next_state_tensor).detach()
+        if done:
+            next_value = torch.FloatTensor([[0.0]]).to(self.device)
         
-        current_value = self.critic(state)
-        value_loss = F.mse_loss(current_value, target.detach())
-        #############################
-
-        # update value
-        self.critic_optimizer.zero_grad()
-        value_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
-        self.critic_optimizer.step()
-
-        # advantage = Q_t - V(s_t)
-        ############TODO#############
-        # policy_loss = ?
-        advantage = target.detach() - current_value.detach()
+        # Calculate returns backwards
+        returns = []
+        g = next_value
+        for transition in reversed(self.transitions):
+            # transition: [state, log_prob, next_state, scaled_reward, done]
+            reward = transition[3]
+            mask = 1 - transition[4]
+            g = reward + self.gamma * g * mask
+            returns.append(g)
+        returns.reverse()
         
-        # Calculate entropy for exploration
-        _, dist = self.actor(state)
-        entropy = dist.entropy().sum(-1)
+        # Convert buffer and returns to tensors
+        states = torch.stack([t[0] for t in self.transitions])
+        log_probs = torch.stack([t[1] for t in self.transitions])
+        returns = torch.stack(returns).detach() # [N, 1]
         
-        policy_loss = - (log_prob * advantage + self.entropy_weight * entropy)
-        #############################
-        # update policy
+        # Value loss
+        values = self.critic(states) # [N, 1]
+        value_loss = F.mse_loss(values, returns)
+        
+        # Policy loss
+        advantages = returns - values.detach()
+        _, dist = self.actor(states)
+        entropy = dist.entropy().sum(-1).mean()
+        
+        policy_loss = -(log_probs * advantages.squeeze(-1)).mean() - self.entropy_weight * entropy
+        
+        # Update
         self.actor_optimizer.zero_grad()
-        policy_loss.backward()
+        self.critic_optimizer.zero_grad()
+        
+        loss = policy_loss + value_loss
+        loss.backward()
+        
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+        
         self.actor_optimizer.step()
-
+        self.critic_optimizer.step()
+        
+        self.transitions = [] # Clear buffer
+        
         return policy_loss.item(), value_loss.item()
 
     def train(self):
@@ -246,26 +258,32 @@ class A2CAgent:
                 state, _ = self.env.reset()
             score = 0
             done = False
+            self.transitions = []
             while not done:
                 # self.env.render()
                 action = self.select_action(state)
                 next_state, reward, done = self.step(action)
-
-                actor_loss, critic_loss = self.update_model()
-                actor_losses.append(actor_loss)
-                critic_losses.append(critic_loss)
+                
+                self.transitions.append(self.transition)
 
                 state = next_state
                 score += reward
                 step_count += 1
-                # W&B logging
-                wandb.log({
-                    "step": step_count,
-                    "actor loss": actor_loss,
-                    "critic loss": critic_loss,
-                    "actor_lr": new_actor_lr,
-                    "entropy_weight": self.entropy_weight
-                    }) 
+                
+                if len(self.transitions) >= self.n_step or done:
+                    actor_loss, critic_loss = self.update_model(next_state, done)
+                    actor_losses.append(actor_loss)
+                    critic_losses.append(critic_loss)
+
+                    # W&B logging
+                    wandb.log({
+                        "step": step_count,
+                        "actor loss": actor_loss,
+                        "critic loss": critic_loss,
+                        "actor_lr": new_actor_lr,
+                        "entropy_weight": self.entropy_weight
+                        }) 
+                
                 # if episode ends
                 if done:
                     print(f"Episode {ep}: Total Reward = {score}")
@@ -360,6 +378,7 @@ if __name__ == "__main__":
     parser.add_argument("--video-dir",          type=str,   default="./videos")
     parser.add_argument("--test",               action="store_true")
     parser.add_argument("--load-ckpt",          type=str)
+    parser.add_argument("--n-step",             type=int,   default=5)
     args = parser.parse_args()
     
     # environment
