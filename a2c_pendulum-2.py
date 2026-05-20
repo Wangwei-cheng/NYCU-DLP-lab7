@@ -130,7 +130,7 @@ class A2CAgent:
         
         # device: cpu / gpu
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(self.device)
+        print(f"Using device: {self.device}")
 
         # networks
         obs_dim = env.observation_space.shape[0]
@@ -164,35 +164,38 @@ class A2CAgent:
 
         return selected_action.clamp(-2.0, 2.0).cpu().detach().numpy()
 
-    def step(self, action: np.ndarray) -> Tuple[np.ndarray, np.float64, bool]:
+    def step(self, action: np.ndarray) -> Tuple[np.ndarray, np.float64, bool, bool]:
         """Take an action and return the response of the env."""
         next_state, reward, terminated, truncated, _ = self.env.step(action)
-        done = terminated or truncated
-
+        
         if not self.is_test:
             # Reward scaling for better stability in Pendulum
             scaled_reward = reward / 10.0
-            self.transition.extend([next_state, scaled_reward, done])
+            # Store [state, log_prob, next_state, scaled_reward, terminated]
+            self.transition.extend([next_state, scaled_reward, terminated])
 
-        return next_state, reward, done
+        return next_state, reward, terminated, truncated
 
-    def update_model(self, next_state, done) -> Tuple[float, float]:
+    def update_model(self, next_state, terminated) -> Tuple[float, float]:
         """Update the model by gradient descent using N-step returns."""
         
-        # Calculate bootstrap value
+        # Bootstrap value from next_state
+        # In Pendulum, we only set value to 0 if terminated (which never happens in normal play).
+        # If truncated (time out at 200 steps), we MUST bootstrap the value of the next state.
         next_state_tensor = torch.FloatTensor(next_state).to(self.device)
-        next_value = self.critic(next_state_tensor).detach() # Shape: [1]
+        next_value = self.critic(next_state_tensor).detach()
         
-        if done:
-            next_value = torch.FloatTensor([0.0]).to(self.device) # Shape: [1]
+        if terminated:
+            next_value = torch.FloatTensor([0.0]).to(self.device)
         
         # Calculate returns backwards
         returns = []
         g = next_value
         for transition in reversed(self.transitions):
-            # transition: [state, log_prob, next_state, scaled_reward, done]
+            # transition: [state, log_prob, next_state, scaled_reward, terminated]
             reward = transition[3]
-            mask = 1 - transition[4]
+            term = transition[4]
+            mask = 1.0 - float(term) # Only mask if terminated
             g = reward + self.gamma * g * mask
             returns.append(g)
         returns.reverse()
@@ -200,12 +203,10 @@ class A2CAgent:
         # Convert buffer and returns to tensors
         states = torch.stack([t[0] for t in self.transitions])
         log_probs = torch.stack([t[1] for t in self.transitions])
-        
-        # Ensure returns is [N, 1] to match values
         returns = torch.stack(returns).detach().view(-1, 1)
         
         # Value loss
-        values = self.critic(states) # [N, 1]
+        values = self.critic(states) 
         value_loss = F.mse_loss(values, returns)
         
         # Policy loss
@@ -238,12 +239,15 @@ class A2CAgent:
         step_count = 0
         last_ckpt_step = 0
         best_score = -float('inf')
+        
+        # Cache losses for step-by-step logging
+        actor_loss, critic_loss = 0, 0
 
         # Initial entropy weight
         init_entropy_weight = self.entropy_weight
 
         state, _ = self.env.reset(seed=self.seed)
-        for ep in tqdm(range(1, self.num_episodes)):
+        for ep in tqdm(range(1, self.num_episodes + 1)):
             # Linear decay for learning rate
             frac = 1.0 - (ep - 1.0) / self.num_episodes
             new_actor_lr = self.actor_lr * frac
@@ -256,16 +260,15 @@ class A2CAgent:
             # Linear decay for entropy weight
             self.entropy_weight = init_entropy_weight * frac
 
-            actor_losses, critic_losses, scores = [], [], []
             if ep > 1:
                 state, _ = self.env.reset()
             score = 0
             done = False
             self.transitions = []
             while not done:
-                # self.env.render()
                 action = self.select_action(state)
-                next_state, reward, done = self.step(action)
+                next_state, reward, terminated, truncated = self.step(action)
+                done = terminated or truncated
                 
                 self.transitions.append(self.transition)
 
@@ -273,28 +276,24 @@ class A2CAgent:
                 score += reward
                 step_count += 1
                 
+                # N-step update
                 if len(self.transitions) >= self.n_step or done:
-                    actor_loss, critic_loss = self.update_model(next_state, done)
-                    actor_losses.append(actor_loss)
-                    critic_losses.append(critic_loss)
-
-                    # W&B logging
-                    wandb.log({
-                        "step": step_count,
-                        "actor loss": actor_loss,
-                        "critic loss": critic_loss,
-                        "actor_lr": new_actor_lr,
-                        "entropy_weight": self.entropy_weight
-                        }) 
+                    actor_loss, critic_loss = self.update_model(next_state, terminated)
                 
+                # W&B logging (NOW LOGS EVERY STEP)
+                wandb.log({
+                    "step": step_count,
+                    "actor loss": actor_loss,
+                    "critic loss": critic_loss,
+                    "actor_lr": new_actor_lr,
+                    "entropy_weight": self.entropy_weight
+                }) 
+
                 # if episode ends
                 if done:
                     print(f"Episode {ep}: Total Reward = {score}")
-                    # W&B logging
-                    wandb.log({
-                        "episode": ep,
-                        "return": score
-                        })
+                    wandb.log({"episode": ep, "return": score})
+            
             # Evaluation every 20 episodes
             if ep % 20 == 0:
                 eval_score = self.evaluate()
@@ -326,7 +325,8 @@ class A2CAgent:
             done = False
             while not done:
                 action = self.select_action(state)
-                next_state, reward, done = self.step(action)
+                next_state, reward, terminated, truncated = self.step(action)
+                done = terminated or truncated
                 state = next_state
                 total_reward += reward
         self.is_test = False
@@ -337,7 +337,7 @@ class A2CAgent:
         self.is_test = True
 
         tmp_env = self.env
-        self.env = gym.wrappers.RecordVideo(self.env, video_folder=video_folder)
+        self.env = gym.wrappers.RecordVideo(self.env, video_folder=video_folder, episode_trigger=lambda x: x == 0)
 
         scores = []
         for i in range(20):
@@ -347,7 +347,8 @@ class A2CAgent:
 
             while not done:
                 action = self.select_action(state)
-                next_state, reward, done = self.step(action)
+                next_state, reward, terminated, truncated = self.step(action)
+                done = terminated or truncated
 
                 state = next_state
                 score += reward
