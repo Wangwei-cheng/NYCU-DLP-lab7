@@ -123,6 +123,9 @@ class A2CAgent:
         self.critic_lr = args.critic_lr
         self.num_episodes = args.num_episodes
         self.ckpt_dir = args.ckpt_dir
+
+        if not os.path.exists(self.ckpt_dir):
+            os.makedirs(self.ckpt_dir)
         
         # device: cpu / gpu
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -145,7 +148,7 @@ class A2CAgent:
         self.total_step = 0
 
         # mode: train / test
-        self.is_test = False
+        self.is_test = True if args.test else False
 
     def select_action(self, state: np.ndarray) -> np.ndarray:
         """Select an action from the input state."""
@@ -308,7 +311,7 @@ class A2CAgent:
         self.is_test = False
         return total_reward / n_episodes
 
-    def test(self, video_folder: str):
+    def test(self, video_folder: str, env_step):
         """Test the agent."""
         self.is_test = True
 
@@ -329,7 +332,7 @@ class A2CAgent:
                 score += reward
             
             scores.append(score)
-            print(f"Episode {i}: score = {score}")
+            print(f"Env Step: {env_step}, Seed: {i}, score = {score}")
 
         print("Average score: ", np.mean(scores))
         self.env.close()
@@ -346,14 +349,17 @@ def seed_torch(seed):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--wandb-run-name", type=str, default="pendulum-a2c-run")
-    parser.add_argument("--actor-lr", type=float, default=1e-4)
-    parser.add_argument("--critic-lr", type=float, default=1e-3)
-    parser.add_argument("--discount-factor", type=float, default=0.9)
-    parser.add_argument("--num-episodes", type=int, default=1000)
-    parser.add_argument("--seed", type=int, default=77)
-    parser.add_argument("--entropy-weight", type=float, default=1e-2) # entropy can be disabled by setting this to 0
-    parser.add_argument("--ckpt_dir", type=str, default="./checkpoints")
+    parser.add_argument("--wandb-run-name",     type=str,   default="pendulum-a2c-run")
+    parser.add_argument("--actor-lr",           type=float, default=1e-4)
+    parser.add_argument("--critic-lr",          type=float, default=1e-3)
+    parser.add_argument("--discount-factor",    type=float, default=0.9)
+    parser.add_argument("--num-episodes",       type=int,   default=1000)
+    parser.add_argument("--seed",               type=int,   default=77)
+    parser.add_argument("--entropy-weight",     type=float, default=1e-2) # entropy can be disabled by setting this to 0
+    parser.add_argument("--ckpt-dir",           type=str,   default="./checkpoints")
+    parser.add_argument("--video-dir",          type=str,   default="./videos")
+    parser.add_argument("--test",               action="store_true")
+    parser.add_argument("--load-ckpt",          type=str)
     args = parser.parse_args()
     
     # environment
@@ -362,7 +368,13 @@ if __name__ == "__main__":
     random.seed(seed)
     np.random.seed(seed)
     seed_torch(seed)
-    wandb.init(project="DLP-Lab7-A2C-Pendulum", name=args.wandb_run_name, save_code=True)
     
-    agent = A2CAgent(env, args)
-    agent.train()
+    if args.test:
+        agent = A2CAgent(env, args)
+        agent.actor.load_state_dict(torch.load(args.load_ckpt))
+        env_step = args.load_ckpt.split('_')[-1].split('.')[0]
+        agent.test(args.video_dir, env_step)
+    else:
+        wandb.init(project="DLP-Lab7-A2C-Pendulum", name=args.wandb_run_name, save_code=True)
+        agent = A2CAgent(env, args)
+        agent.train()

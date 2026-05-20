@@ -1,2 +1,7 @@
 wandb/
 *.log
+*.pt
+*.pth
+checkpoints/
+videos/
+*.mp4
