@@ -181,9 +181,10 @@ class A2CAgent:
         
         # Calculate bootstrap value
         next_state_tensor = torch.FloatTensor(next_state).to(self.device)
-        next_value = self.critic(next_state_tensor).detach()
+        next_value = self.critic(next_state_tensor).detach() # Shape: [1]
+        
         if done:
-            next_value = torch.FloatTensor([[0.0]]).to(self.device)
+            next_value = torch.FloatTensor([0.0]).to(self.device) # Shape: [1]
         
         # Calculate returns backwards
         returns = []
@@ -199,7 +200,9 @@ class A2CAgent:
         # Convert buffer and returns to tensors
         states = torch.stack([t[0] for t in self.transitions])
         log_probs = torch.stack([t[1] for t in self.transitions])
-        returns = torch.stack(returns).detach() # [N, 1]
+        
+        # Ensure returns is [N, 1] to match values
+        returns = torch.stack(returns).detach().view(-1, 1)
         
         # Value loss
         values = self.critic(states) # [N, 1]
