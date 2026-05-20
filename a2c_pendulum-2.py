@@ -142,6 +142,14 @@ class A2CAgent:
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.actor_lr)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self.critic_lr)
 
+        # schedulers
+        self.actor_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.actor_optimizer, T_max=self.num_episodes, eta_min=self.actor_lr * 0.01
+        )
+        self.critic_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.critic_optimizer, T_max=self.num_episodes, eta_min=self.critic_lr * 0.01
+        )
+
         # transition (state, log_prob, next_state, reward, done)
         self.transition: list = list()
         self.transitions: list = list()
@@ -248,16 +256,11 @@ class A2CAgent:
 
         state, _ = self.env.reset(seed=self.seed)
         for ep in tqdm(range(1, self.num_episodes + 1)):
-            # Linear decay for learning rate
-            frac = 1.0 - (ep - 1.0) / self.num_episodes
-            new_actor_lr = self.actor_lr * frac
-            new_critic_lr = self.critic_lr * frac
-            for param_group in self.actor_optimizer.param_groups:
-                param_group['lr'] = new_actor_lr
-            for param_group in self.critic_optimizer.param_groups:
-                param_group['lr'] = new_critic_lr
+            # Get current LR from schedulers for logging
+            curr_actor_lr = self.actor_optimizer.param_groups[0]['lr']
 
             # Linear decay for entropy weight
+            frac = 1.0 - (ep - 1.0) / self.num_episodes
             self.entropy_weight = init_entropy_weight * frac
 
             if ep > 1:
@@ -285,7 +288,7 @@ class A2CAgent:
                     "step": step_count,
                     "actor loss": actor_loss,
                     "critic loss": critic_loss,
-                    "actor_lr": new_actor_lr,
+                    "actor_lr": curr_actor_lr,
                     "entropy_weight": self.entropy_weight
                 }) 
 
@@ -293,6 +296,10 @@ class A2CAgent:
                 if done:
                     print(f"Episode {ep}: Total Reward = {score}")
                     wandb.log({"episode": ep, "return": score})
+            
+            # Step the schedulers at the end of each episode
+            self.actor_scheduler.step()
+            self.critic_scheduler.step()
             
             # Evaluation every 20 episodes
             if ep % 20 == 0:
