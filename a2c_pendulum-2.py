@@ -124,6 +124,9 @@ class A2CAgent:
         self.num_episodes = args.num_episodes
         self.ckpt_dir = args.ckpt_dir
         self.n_step = args.n_step
+        self.entropy_weight_decay = args.ewd
+        self.lr_annealing = args.lr_annealing
+        self.ew_min = args.ew_min
 
         if not os.path.exists(self.ckpt_dir):
             os.makedirs(self.ckpt_dir)
@@ -250,18 +253,18 @@ class A2CAgent:
         
         # Cache losses for step-by-step logging
         actor_loss, critic_loss = 0, 0
-
-        # Initial entropy weight
-        init_entropy_weight = self.entropy_weight
+        if self.entropy_weight_decay:
+            # Initial entropy weight
+            init_entropy_weight = self.entropy_weight
 
         state, _ = self.env.reset(seed=self.seed)
         for ep in tqdm(range(1, self.num_episodes + 1)):
             # Get current LR from schedulers for logging
             curr_actor_lr = self.actor_optimizer.param_groups[0]['lr']
-
-            # Linear decay for entropy weight
-            frac = 1.0 - (ep - 1.0) / self.num_episodes
-            self.entropy_weight = init_entropy_weight * frac
+            if self.entropy_weight_decay:
+                # Linear decay for entropy weight
+                frac = 1.0 - (ep - 1.0) / self.num_episodes
+                self.entropy_weight = max(init_entropy_weight * frac, self.ew_min)
 
             if ep > 1:
                 state, _ = self.env.reset()
@@ -283,7 +286,7 @@ class A2CAgent:
                 if len(self.transitions) >= self.n_step or done:
                     actor_loss, critic_loss = self.update_model(next_state, terminated)
                 
-                # W&B logging (NOW LOGS EVERY STEP)
+                # W&B logging
                 wandb.log({
                     "step": step_count,
                     "actor loss": actor_loss,
@@ -306,6 +309,12 @@ class A2CAgent:
                 eval_score = self.evaluate()
                 wandb.log({"eval_return": eval_score})
                 print(f"--- Evaluation at Episode {ep}: Average Reward = {eval_score} ---")
+                if eval_score >= -150.0:
+                    succes_actor_path = os.path.join(self.ckpt_dir, f"a2c_actor_pass_{step_count}.pt")
+                    succes_critic_path = os.path.join(self.ckpt_dir, f"a2c_critic_pass_{step_count}.pt")
+                    torch.save(self.actor.state_dict(), succes_actor_path)
+                    torch.save(self.critic.state_dict(), succes_critic_path)
+                    print(f"CONGRATULATIONS! Saved model for passing score at step {step_count}!")
                 if eval_score > best_score:
                     best_score = eval_score
                     torch.save(self.actor.state_dict(), os.path.join(self.ckpt_dir, "a2c_actor_best.pt"))
@@ -327,8 +336,8 @@ class A2CAgent:
         """Evaluate the agent for n_episodes."""
         self.is_test = True
         total_reward = 0
-        for _ in range(n_episodes):
-            state, _ = self.env.reset()
+        for i in range(n_episodes):
+            state, _ = self.env.reset(seed=i)
             done = False
             while not done:
                 action = self.select_action(state)
@@ -336,6 +345,7 @@ class A2CAgent:
                 done = terminated or truncated
                 state = next_state
                 total_reward += reward
+        
         self.is_test = False
         return total_reward / n_episodes
 
@@ -387,9 +397,13 @@ if __name__ == "__main__":
     parser.add_argument("--entropy-weight",     type=float, default=1e-2) # entropy can be disabled by setting this to 0
     parser.add_argument("--ckpt-dir",           type=str,   default="./checkpoints")
     parser.add_argument("--video-dir",          type=str,   default="./videos")
-    parser.add_argument("--test",               action="store_true")
     parser.add_argument("--load-ckpt",          type=str)
     parser.add_argument("--n-step",             type=int,   default=5)
+    parser.add_argument("--ew-min",             type=int,   default=1e-3)
+
+    parser.add_argument("--test",               action="store_true")
+    parser.add_argument("--ewd",                action="store_true")
+    parser.add_argument("--lr-annealing",       action="store_true")
     args = parser.parse_args()
     
     # environment
@@ -405,6 +419,11 @@ if __name__ == "__main__":
         env_step = args.load_ckpt.split('_')[-1].split('.')[0]
         agent.test(args.video_dir, env_step)
     else:
-        wandb.init(project="DLP-Lab7-A2C-Pendulum", name=args.wandb_run_name, save_code=True)
+        with_lr_annealing = "w" if args.lr_annealing else "wo"
+        if args.ewd:
+            run_name = f"ew_{args.entropy_weight}_ewmin_{args.ew_min}_alr_{args.actor_lr}_clr_{args.critic_lr}_ep_{args.num_episodes}_nstep_{args.n_step}"
+        else:
+            run_name = f"woewd_ew_{args.entropy_weight}_alr_{args.actor_lr}_clr_{args.critic_lr}_ep_{args.num_episodes}_nstep_{args.n_step}"
+        wandb.init(project="DLP-Lab7-A2C-Pendulum", name=run_name, save_code=True)
         agent = A2CAgent(env, args)
         agent.train()

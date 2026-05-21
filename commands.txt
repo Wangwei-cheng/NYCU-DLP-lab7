@@ -2,5 +2,9 @@ python a2c_pendulum-2.py
 python a2c_pendulum-2.py --actor-lr 3e-4 --entropy-weight 1e-3
 python a2c_pendulum-2.py --actor-lr 5e-4 --entropy-weight 5e-3 --num-episodes 1500
 python a2c_pendulum-2.py --actor-lr 5e-4 --critic-lr 5e-3 --num-episodes 1500
+python a2c_pendulum-2.py --actor-lr 5e-4 --critic-lr 5e-3 --num-episodes 1500 --n-step 1
+python a2c_pendulum-2.py --actor-lr 5e-4 --critic-lr 5e-3 --entropy-weight 1e-3 --num-episodes 1500
+python a2c_pendulum-2.py --actor-lr 5e-4 --critic-lr 5e-3 --ewd --num-episodes 1500
+python a2c_pendulum-2.py --actor-lr 5e-4 --critic-lr 5e-3 --ewd --num-episodes 1500
 
-python a2c_pendulum-2.py --test --load-ckpt ./checkpoints/a2c_actor_150k.pt
+python a2c_pendulum-2.py --test --load-ckpt ./checkpoints/a2c_actor_200k.pt
