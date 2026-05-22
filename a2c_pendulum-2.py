@@ -324,7 +324,7 @@ class A2CAgent:
             done = False
             while not done:
                 action = self.select_action(state)
-                next_state, reward, terminated, truncated = self.step(action)
+                next_state, reward, done = self.step(action)
                 done = terminated or truncated
                 state = next_state
                 total_reward += reward
@@ -406,6 +406,6 @@ if __name__ == "__main__":
             run_name = f"ew_{args.entropy_weight}_ewmin_{args.ew_min}_alr_{args.actor_lr}_clr_{args.critic_lr}_ep_{args.num_episodes}"
         else:
             run_name = f"ew_{args.entropy_weight}_alr_{args.actor_lr}_clr_{args.critic_lr}_ep_{args.num_episodes}"
-        wandb.init(project="DLP-Lab7-A2C-Pendulum-v3", name=run_name, save_code=True)
+        wandb.init(project="DLP-Lab7-A2C-Pendulum", name=run_name, save_code=True)
         agent = A2CAgent(env, args)
         agent.train()
