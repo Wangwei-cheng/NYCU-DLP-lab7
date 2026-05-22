@@ -40,8 +40,6 @@ class Actor(nn.Module):
         self.mu_layer = nn.Linear(512, out_dim)
         self.log_std_layer = nn.Linear(512, out_dim)
 
-        initialize_uniformly(self.fc1)
-        initialize_uniformly(self.fc2)
         initialize_uniformly(self.mu_layer)
         initialize_uniformly(self.log_std_layer)
         #############################
@@ -78,8 +76,6 @@ class Critic(nn.Module):
         self.fc2 = nn.Linear(256, 512)
         self.value_layer = nn.Linear(512, 1)
 
-        initialize_uniformly(self.fc1)
-        initialize_uniformly(self.fc2)
         initialize_uniformly(self.value_layer)
         #############################
 
@@ -122,8 +118,8 @@ class A2CAgent:
         self.actor_lr = args.actor_lr
         self.critic_lr = args.critic_lr
         self.num_episodes = args.num_episodes
+
         self.ckpt_dir = args.ckpt_dir
-        self.n_step = args.n_step
         self.entropy_weight_decay = args.ewd
         self.lr_annealing = args.lr_annealing
         self.ew_min = args.ew_min
@@ -146,16 +142,16 @@ class A2CAgent:
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self.critic_lr)
 
         # schedulers
-        self.actor_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.actor_optimizer, T_max=self.num_episodes, eta_min=self.actor_lr * 0.01
-        )
-        self.critic_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.critic_optimizer, T_max=self.num_episodes, eta_min=self.critic_lr * 0.01
-        )
+        if self.lr_annealing:
+            self.actor_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                self.actor_optimizer, T_max=self.num_episodes, eta_min=self.actor_lr * 0.01
+            )
+            self.critic_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                self.critic_optimizer, T_max=self.num_episodes, eta_min=self.critic_lr * 0.01
+            )
 
         # transition (state, log_prob, next_state, reward, done)
         self.transition: list = list()
-        self.transitions: list = list()
 
         # total steps count
         self.total_step = 0
@@ -175,73 +171,61 @@ class A2CAgent:
 
         return selected_action.clamp(-2.0, 2.0).cpu().detach().numpy()
 
-    def step(self, action: np.ndarray) -> Tuple[np.ndarray, np.float64, bool, bool]:
+    def step(self, action: np.ndarray) -> Tuple[np.ndarray, np.float64, bool]:
         """Take an action and return the response of the env."""
         next_state, reward, terminated, truncated, _ = self.env.step(action)
-        
+        done = terminated or truncated
+
         if not self.is_test:
             # Reward scaling for better stability in Pendulum
-            scaled_reward = reward / 10.0
-            # Store [state, log_prob, next_state, scaled_reward, terminated]
-            self.transition.extend([next_state, scaled_reward, terminated])
+            # scaled_reward = reward / 10.0
+            self.transition.extend([next_state, reward, done])
 
-        return next_state, reward, terminated, truncated
+        return next_state, reward, done
 
-    def update_model(self, next_state, terminated) -> Tuple[float, float]:
-        """Update the model by gradient descent using N-step returns."""
+    def update_model(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Update the model by gradient descent."""
+        state, log_prob, next_state, reward, done = self.transition
+
+        # Q_t   = r + gamma * V(s_{t+1})  if state != Terminal
+        #       = r                       otherwise
+        mask = 1 - done
+
+        ############TODO#############
+        # value_loss = ?
+        next_state_tensor = torch.FloatTensor(next_state).to(self.device)
+        next_value = self.critic(next_state_tensor).detach()
         
         # Bootstrap value from next_state
         # In Pendulum, we only set value to 0 if terminated (which never happens in normal play).
         # If truncated (time out at 200 steps), we MUST bootstrap the value of the next state.
-        next_state_tensor = torch.FloatTensor(next_state).to(self.device)
-        next_value = self.critic(next_state_tensor).detach()
         
-        if terminated:
-            next_value = torch.FloatTensor([0.0]).to(self.device)
-        
-        # Calculate returns backwards
-        returns = []
-        g = next_value
-        for transition in reversed(self.transitions):
-            # transition: [state, log_prob, next_state, scaled_reward, terminated]
-            reward = transition[3]
-            term = transition[4]
-            mask = 1.0 - float(term) # Only mask if terminated
-            g = reward + self.gamma * g * mask
-            returns.append(g)
-        returns.reverse()
-        
-        # Convert buffer and returns to tensors
-        states = torch.stack([t[0] for t in self.transitions])
-        log_probs = torch.stack([t[1] for t in self.transitions])
-        returns = torch.stack(returns).detach().view(-1, 1)
-        
-        # Value loss
-        values = self.critic(states) 
-        value_loss = F.mse_loss(values, returns)
-        
-        # Policy loss
-        advantages = returns - values.detach()
-        _, dist = self.actor(states)
-        entropy = dist.entropy().sum(-1).mean()
-        
-        policy_loss = -(log_probs * advantages.squeeze(-1)).mean() - self.entropy_weight * entropy
-        
-        # Update
-        self.actor_optimizer.zero_grad()
+        target = reward + self.gamma * next_value * mask
+        current_value = self.critic(state)
+        value_loss = F.mse_loss(current_value, target.detach())
+        #############################
+
+        # update value
         self.critic_optimizer.zero_grad()
-        
-        loss = policy_loss + value_loss
-        loss.backward()
-        
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
-        
-        self.actor_optimizer.step()
+        value_loss.backward()
         self.critic_optimizer.step()
+
+        # advantage = Q_t - V(s_t)
+        ############TODO#############
+        # policy_loss = ?
+        advantage = target.detach() - current_value.detach()
         
-        self.transitions = [] # Clear buffer
+        # Calculate entropy for exploration
+        _, dist = self.actor(state)
+        entropy = dist.entropy().sum(-1)
         
+        policy_loss = - (log_prob * advantage + self.entropy_weight * entropy)
+        #############################
+        # update policy
+        self.actor_optimizer.zero_grad()
+        policy_loss.backward()
+        self.actor_optimizer.step()
+
         return policy_loss.item(), value_loss.item()
 
     def train(self):
@@ -251,18 +235,18 @@ class A2CAgent:
         last_ckpt_step = 0
         best_score = -float('inf')
         
-        # Cache losses for step-by-step logging
-        actor_loss, critic_loss = 0, 0
+        # Initial entropy weight if decay is enabled
         if self.entropy_weight_decay:
-            # Initial entropy weight
             init_entropy_weight = self.entropy_weight
 
         state, _ = self.env.reset(seed=self.seed)
         for ep in tqdm(range(1, self.num_episodes + 1)):
+            actor_losses, critic_losses, scores = [], [], []
+
             # Get current LR from schedulers for logging
             curr_actor_lr = self.actor_optimizer.param_groups[0]['lr']
+            # Linear decay for entropy weight
             if self.entropy_weight_decay:
-                # Linear decay for entropy weight
                 frac = 1.0 - (ep - 1.0) / self.num_episodes
                 self.entropy_weight = max(init_entropy_weight * frac, self.ew_min)
 
@@ -270,22 +254,20 @@ class A2CAgent:
                 state, _ = self.env.reset()
             score = 0
             done = False
-            self.transitions = []
+
             while not done:
+                # self.env.render()
                 action = self.select_action(state)
-                next_state, reward, terminated, truncated = self.step(action)
-                done = terminated or truncated
-                
-                self.transitions.append(self.transition)
+                next_state, reward, done = self.step(action)
+
+                actor_loss, critic_loss = self.update_model()
+                actor_losses.append(actor_loss)
+                critic_losses.append(critic_loss)
 
                 state = next_state
                 score += reward
                 step_count += 1
-                
-                # N-step update
-                if len(self.transitions) >= self.n_step or done:
-                    actor_loss, critic_loss = self.update_model(next_state, terminated)
-                
+
                 # W&B logging
                 wandb.log({
                     "step": step_count,
@@ -294,15 +276,16 @@ class A2CAgent:
                     "actor_lr": curr_actor_lr,
                     "entropy_weight": self.entropy_weight
                 }) 
-
                 # if episode ends
                 if done:
+                    scores.append(score)
                     print(f"Episode {ep}: Total Reward = {score}")
                     wandb.log({"episode": ep, "return": score})
             
             # Step the schedulers at the end of each episode
-            self.actor_scheduler.step()
-            self.critic_scheduler.step()
+            if self.lr_annealing:
+                self.actor_scheduler.step()
+                self.critic_scheduler.step()
             
             # Evaluation every 20 episodes
             if ep % 20 == 0:
@@ -398,8 +381,7 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt-dir",           type=str,   default="./checkpoints")
     parser.add_argument("--video-dir",          type=str,   default="./videos")
     parser.add_argument("--load-ckpt",          type=str)
-    parser.add_argument("--n-step",             type=int,   default=5)
-    parser.add_argument("--ew-min",             type=int,   default=1e-3)
+    parser.add_argument("--ew-min",             type=float, default=1e-3)
 
     parser.add_argument("--test",               action="store_true")
     parser.add_argument("--ewd",                action="store_true")
@@ -421,9 +403,9 @@ if __name__ == "__main__":
     else:
         with_lr_annealing = "w" if args.lr_annealing else "wo"
         if args.ewd:
-            run_name = f"ew_{args.entropy_weight}_ewmin_{args.ew_min}_alr_{args.actor_lr}_clr_{args.critic_lr}_ep_{args.num_episodes}_nstep_{args.n_step}"
+            run_name = f"ew_{args.entropy_weight}_ewmin_{args.ew_min}_alr_{args.actor_lr}_clr_{args.critic_lr}_ep_{args.num_episodes}"
         else:
-            run_name = f"woewd_ew_{args.entropy_weight}_alr_{args.actor_lr}_clr_{args.critic_lr}_ep_{args.num_episodes}_nstep_{args.n_step}"
-        wandb.init(project="DLP-Lab7-A2C-Pendulum", name=run_name, save_code=True)
+            run_name = f"ew_{args.entropy_weight}_alr_{args.actor_lr}_clr_{args.critic_lr}_ep_{args.num_episodes}"
+        wandb.init(project="DLP-Lab7-A2C-Pendulum-v3", name=run_name, save_code=True)
         agent = A2CAgent(env, args)
         agent.train()
