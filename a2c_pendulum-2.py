@@ -35,11 +35,16 @@ class Actor(nn.Module):
         
         ############TODO#############
         # Remeber to initialize the layer weights
-        self.fc1 = nn.Linear(in_dim, 256)
-        self.fc2 = nn.Linear(256, 512)
-        self.mu_layer = nn.Linear(512, out_dim)
-        self.log_std_layer = nn.Linear(512, out_dim)
+        self.hidden1 = nn.Linear(in_dim, 256)
+        self.hidden2 = nn.Linear(256, 512)
+        self.hidden3 = nn.Linear(512, 256)
+        self.mu_layer = nn.Linear(256, out_dim)
+        self.log_std_layer = nn.Linear(256, out_dim)
+        self.log_std_min, self.log_std_max = -20, 2
 
+        initialize_uniformly(self.hidden1)
+        initialize_uniformly(self.hidden2)
+        initialize_uniformly(self.hidden3)
         initialize_uniformly(self.mu_layer)
         initialize_uniformly(self.log_std_layer)
         #############################
@@ -48,14 +53,15 @@ class Actor(nn.Module):
         """Forward method implementation."""
 
         ############TODO#############
-        x = F.relu(self.fc1(state))
-        x = F.relu(self.fc2(x))
-        
+        x = F.relu(self.hidden1(state))
+        x = F.relu(self.hidden2(x))
+        x = F.relu(self.hidden3(x))
+
         mu = torch.tanh(self.mu_layer(x)) * 2.0
         log_std = self.log_std_layer(x)
         
         # Clamp log_std to prevent NaN and ensure numerical stability
-        log_std = torch.clamp(log_std, min=-20, max=2)
+        log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
         std = torch.exp(log_std) + 1e-5
         
         dist = Normal(mu, std)
@@ -72,10 +78,14 @@ class Critic(nn.Module):
         
         ############TODO#############
         # Remeber to initialize the layer weights
-        self.fc1 = nn.Linear(in_dim, 256)
-        self.fc2 = nn.Linear(256, 512)
-        self.value_layer = nn.Linear(512, 1)
+        self.hidden1 = nn.Linear(in_dim, 512)
+        self.hidden2 = nn.Linear(512, 512)
+        self.hidden3 = nn.Linear(512, 256)
+        self.value_layer = nn.Linear(256, 1)
 
+        initialize_uniformly(self.hidden1)
+        initialize_uniformly(self.hidden2)
+        initialize_uniformly(self.hidden3)
         initialize_uniformly(self.value_layer)
         #############################
 
@@ -83,8 +93,9 @@ class Critic(nn.Module):
         """Forward method implementation."""
         
         ############TODO#############
-        x = F.relu(self.fc1(state))
-        x = F.relu(self.fc2(x))
+        x = F.relu(self.hidden1(state))
+        x = F.relu(self.hidden2(x))
+        x = F.relu(self.hidden3(x))
         value = self.value_layer(x)
         #############################
 
@@ -121,7 +132,7 @@ class A2CAgent:
 
         self.ckpt_dir = args.ckpt_dir
         self.entropy_weight_decay = args.ewd
-        self.lr_annealing = args.lr_annealing
+        self.lr_annealing = args.lra
         self.ew_min = args.ew_min
 
         if not os.path.exists(self.ckpt_dir):
@@ -325,7 +336,6 @@ class A2CAgent:
             while not done:
                 action = self.select_action(state)
                 next_state, reward, done = self.step(action)
-                done = terminated or truncated
                 state = next_state
                 total_reward += reward
         
@@ -385,7 +395,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--test",               action="store_true")
     parser.add_argument("--ewd",                action="store_true")
-    parser.add_argument("--lr-annealing",       action="store_true")
+    parser.add_argument("--lra",                action="store_true")
     args = parser.parse_args()
     
     # environment
@@ -401,11 +411,11 @@ if __name__ == "__main__":
         env_step = args.load_ckpt.split('_')[-1].split('.')[0]
         agent.test(args.video_dir, env_step)
     else:
-        with_lr_annealing = "w" if args.lr_annealing else "wo"
+        with_lra = "_lra" if args.lra else ""
         if args.ewd:
-            run_name = f"ew_{args.entropy_weight}_ewmin_{args.ew_min}_alr_{args.actor_lr}_clr_{args.critic_lr}_ep_{args.num_episodes}"
+            run_name = f"ew_{args.entropy_weight}_ewmin_{args.ew_min}_alr_{args.actor_lr}_clr_{args.critic_lr}{with_lra}_ep_{args.num_episodes}"
         else:
-            run_name = f"ew_{args.entropy_weight}_alr_{args.actor_lr}_clr_{args.critic_lr}_ep_{args.num_episodes}"
+            run_name = f"ew_{args.entropy_weight}_alr_{args.actor_lr}_clr_{args.critic_lr}{with_lra}_ep_{args.num_episodes}"
         wandb.init(project="DLP-Lab7-A2C-Pendulum", name=run_name, save_code=True)
         agent = A2CAgent(env, args)
         agent.train()
