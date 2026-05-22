@@ -43,14 +43,34 @@ class Actor(nn.Module):
 
         ############TODO#############
         # Remeber to initialize the layer weights
+        self.log_std_min = log_std_min
+        self.log_std_max = log_std_max
         
+        self.hidden1 = nn.Linear(in_dim, 256)
+        self.hidden2 = nn.Linear(256, 512)
+        self.mu_layer = nn.Linear(512, out_dim)
+        self.log_std_layer = nn.Linear(512, out_dim)
+
+        init_layer_uniform(self.hidden1)
+        init_layer_uniform(self.hidden2)
+        init_layer_uniform(self.mu_layer)
+        init_layer_uniform(self.log_std_layer)
         #############################
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         """Forward method implementation."""
         
         ############TODO#############
-
+        x = F.relu(self.hidden1(state))
+        x = F.relu(self.hidden2(x))
+        
+        mu = torch.tanh(self.mu_layer(x)) * 2.0
+        log_std = self.log_std_layer(x)
+        log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
+        std = torch.exp(log_std)
+        
+        dist = Normal(mu, std)
+        action = dist.sample()
         #############################
 
         return action, dist
@@ -63,14 +83,22 @@ class Critic(nn.Module):
 
         ############TODO#############
         # Remeber to initialize the layer weights
-        
+        self.hidden1 = nn.Linear(in_dim, 256)
+        self.hidden2 = nn.Linear(256, 512)
+        self.value_layer = nn.Linear(512, 1)
+
+        init_layer_uniform(self.hidden1)
+        init_layer_uniform(self.hidden2)
+        init_layer_uniform(self.value_layer)
         #############################
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         """Forward method implementation."""
         
         ############TODO#############
-
+        x = F.relu(self.hidden1(state))
+        x = F.relu(self.hidden2(x))
+        value = self.value_layer(x)
         #############################
 
         return value
@@ -80,7 +108,15 @@ def compute_gae(
     """Compute gae."""
 
     ############TODO#############
-
+    values = values + [next_value]
+    gae = 0
+    returns = []
+    
+    for step in reversed(range(len(rewards))):
+        delta = rewards[step] + gamma * values[step + 1] * masks[step] - values[step]
+        gae = delta + gamma * tau * masks[step] * gae
+        returns.insert(0, gae + values[step])
+    gae_returns = returns
     #############################
     return gae_returns
 
@@ -149,8 +185,8 @@ class PPOAgent:
         self.critic = Critic(self.obs_dim).to(self.device)
 
         # optimizer
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=0.001)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=0.005)
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=args.actor_lr)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=args.critic_lr)
 
         # memory for training
         self.states: List[torch.Tensor] = []
@@ -236,13 +272,16 @@ class PPOAgent:
             # actor_loss
             ############TODO#############
             # actor_loss = ?
-            
+            entropy = dist.entropy().mean()
+            surr1 = ratio * adv
+            surr2 = torch.clamp(ratio, 1.0 - self.epsilon, 1.0 + self.epsilon) * adv
+            actor_loss = -torch.min(surr1, surr2).mean() - self.entropy_weight * entropy
             #############################
 
             # critic_loss
             ############TODO#############
             # critic_loss = ?
-
+            critic_loss = F.mse_loss(self.critic(state), return_)
             #############################
             
             # train critic
