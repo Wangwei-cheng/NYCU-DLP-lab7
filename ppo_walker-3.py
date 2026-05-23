@@ -133,16 +133,21 @@ def ppo_iter(
     """Get mini-batches."""
     batch_size = states.size(0)
     for _ in range(update_epoch):
-        for _ in range(batch_size // mini_batch_size):
-            # 本來是隨機取樣可重複，為了確保每個樣本都被訓練到，改成不重複的隨機取樣
-            ids = np.random.permutation(batch_size)
-            for i in range(0, batch_size, mini_batch_size):
-                if i + mini_batch_size > batch_size:
-                    break
-                rand_ids = ids[i : i + mini_batch_size]
-            yield states[rand_ids, :], actions[rand_ids], values[rand_ids], log_probs[
-                rand_ids
-            ], returns[rand_ids], advantages[rand_ids]
+        # 本來是隨機取樣可重複，為了確保每個樣本都被訓練到，改成不重複的隨機取樣
+        ids = np.random.permutation(batch_size)
+        for start in range(0, batch_size, mini_batch_size):
+            end = start + mini_batch_size
+            if end > batch_size:
+                end = batch_size
+            rand_ids = ids[start:end]
+            yield (
+                states[rand_ids, :], 
+                actions[rand_ids], 
+                values[rand_ids], 
+                log_probs[rand_ids], 
+                returns[rand_ids], 
+                advantages[rand_ids]
+            )
 
 class PPOAgent:
     """PPO Agent.
@@ -177,7 +182,7 @@ class PPOAgent:
         self.seed = args.seed
         self.update_epoch = args.update_epoch
         self.ckpt_dir = args.ckpt_dir
-        self.eval_env = gym.make("Walker2d-v5", render_mode="rgb_array")
+        self.eval_env = gym.make("Walker2d-v5")
 
         if not os.path.exists(self.ckpt_dir):
             os.makedirs(self.ckpt_dir)
@@ -213,15 +218,18 @@ class PPOAgent:
     def select_action(self, state: np.ndarray) -> np.ndarray:
         """Select an action from the input state."""
         state = torch.FloatTensor(state).to(self.device)
-        action, dist = self.actor(state)
-        selected_action = dist.mean if self.is_test else action
+        with torch.no_grad():
+            action, dist = self.actor(state)
+            selected_action = dist.mean if self.is_test else action
 
-        if not self.is_test:
-            value = self.critic(state)
-            self.states.append(state)
-            self.actions.append(selected_action)
-            self.values.append(value)
-            self.log_probs.append(dist.log_prob(selected_action))
+            if not self.is_test:
+                value = self.critic(state)
+                self.states.append(state)
+                self.actions.append(selected_action)
+                self.values.append(value)
+                # joint propability
+                log_prob = dist.log_prob(selected_action).sum(dim=-1, keepdim=True)
+                self.log_probs.append(log_prob)
 
         return selected_action.cpu().detach().numpy()
 
@@ -242,7 +250,8 @@ class PPOAgent:
     def update_model(self, next_state: np.ndarray) -> Tuple[float, float, float]:
         """Update the model by gradient descent."""
         next_state = torch.FloatTensor(next_state).to(self.device)
-        next_value = self.critic(next_state)
+        with torch.no_grad():
+            next_value = self.critic(next_state)
 
         returns = compute_gae(
             next_value,
@@ -259,6 +268,8 @@ class PPOAgent:
         values = torch.cat(self.values).detach()
         log_probs = torch.cat(self.log_probs).detach()
         advantages = returns - values
+        # normalize advantages
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         actor_losses, critic_losses = [], []
 
@@ -274,13 +285,14 @@ class PPOAgent:
         ):
             # calculate ratios
             _, dist = self.actor(state)
-            log_prob = dist.log_prob(action)
+            # joint propability
+            log_prob = dist.log_prob(action).sum(dim=-1, keepdim=True)
             ratio = (log_prob - old_log_prob).exp()
 
             # actor_loss
             ############TODO#############
             # actor_loss = ?
-            entropy = dist.entropy().mean()
+            entropy = dist.entropy().sum(dim=-1).mean()
             surr1 = ratio * adv
             surr2 = torch.clamp(ratio, 1.0 - self.epsilon, 1.0 + self.epsilon) * adv
             actor_loss = -torch.min(surr1, surr2).mean() - self.entropy_weight * entropy
@@ -295,11 +307,13 @@ class PPOAgent:
             # train critic
             self.critic_optimizer.zero_grad()
             critic_loss.backward(retain_graph=True)
+            nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=0.5)
             self.critic_optimizer.step()
 
             # train actor
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
+            nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=0.5)
             self.actor_optimizer.step()
 
             actor_losses.append(actor_loss.item())
@@ -335,7 +349,9 @@ class PPOAgent:
                 self.total_step += 1
                 action = self.select_action(state)
                 action = action.reshape(self.action_dim,)
-                next_state, reward, done = self.step(action)
+
+                clipped_action = np.clip(action, -1.0, 1.0)
+                next_state, reward, done = self.step(clipped_action)
 
                 state = next_state
                 score += reward[0][0]
@@ -347,10 +363,7 @@ class PPOAgent:
                     state = np.expand_dims(state, axis=0)
                     scores.append(score)
                     
-                    wandb.log({
-                        "return": score, 
-                        "episode": episode_count
-                    }, step=self.total_step)
+                    wandb.log({"return": score}, step=self.total_step)
                     
                     print(f"Episode {episode_count}: Total Reward = {score}")
                     score = 0
@@ -378,16 +391,17 @@ class PPOAgent:
                 "entropy": entropy,
             }, step=self.total_step)
 
-            eval_score = self.evaluate()
-            wandb.log({"eval_score": eval_score}, step=self.total_step)
-            print(f"--- Evaluation at Step {self.total_step}: Average Reward = {eval_score} ---")
+            if ep % 10 == 0:
+                eval_score = self.evaluate()
+                wandb.log({"eval_score": eval_score}, step=self.total_step)
+                print(f"--- Evaluation at Step {self.total_step}: Average Reward = {eval_score} ---")
 
-            if eval_score > best_score:
-                best_score = eval_score
-                self.save_model("task3_best.pt")
-                print(f"New best score: {best_score} at Step {self.total_step}. Models saved.")
-                if eval_score >= 2500.0:
-                    print("=========CONGRATULATIONS!=========")
+                if eval_score > best_score:
+                    best_score = eval_score
+                    self.save_model("task3_best.pt")
+                    print(f"New best score: {best_score} at Step {self.total_step}. Models saved.")
+                    if eval_score >= 2500.0:
+                        print("=========CONGRATULATIONS!=========")
 
         # termination
         self.env.close()
@@ -404,7 +418,8 @@ class PPOAgent:
                 action = self.select_action(state)
                 action = action.reshape(self.action_dim,)
 
-                next_state, reward, terminated, truncated, _ = self.eval_env.step(action)
+                clipped_action = np.clip(action, -1.0, 1.0)
+                next_state, reward, terminated, truncated, _ = self.eval_env.step(clipped_action)
                 done = terminated or truncated
                 
                 state = np.expand_dims(next_state, axis=0)
@@ -436,7 +451,8 @@ class PPOAgent:
 
             while not done:
                 action = self.select_action(state)
-                next_state, reward, done = self.step(action)
+                clipped_action = np.clip(action, -1.0, 1.0)
+                next_state, reward, done = self.step(clipped_action)
 
                 state = next_state
                 score += reward
@@ -473,7 +489,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
  
     # environment
-    env = gym.make("Walker2d-v5", render_mode="rgb_array")
+    env = gym.make("Walker2d-v5")
     seed = args.seed
     random.seed(seed)
     np.random.seed(seed)

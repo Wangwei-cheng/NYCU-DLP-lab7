@@ -20,4 +20,4 @@ python ppo_pendulum-3.py
 
 # ppo walker training
 python ppo_walker-3.py
-python ppo_walker-3.py --entropy-weight 1e-3 --actor-lr 1e-4 --critic-lr 1e-3
+python ppo_walker-3.py --entropy-weight 1e-3 --actor-lr 1e-4 --critic-lr 1e-4
