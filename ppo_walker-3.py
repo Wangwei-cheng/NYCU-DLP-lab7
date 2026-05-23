@@ -46,15 +46,11 @@ class Actor(nn.Module):
         ############TODO#############
         # Remeber to initialize the layer weights
         self.hidden1 = nn.Linear(in_dim, 256)
-        self.hidden2 = nn.Linear(256, 512)
-        self.hidden3 = nn.Linear(512, 256)
+        self.hidden2 = nn.Linear(256, 256)
         self.mu_layer = nn.Linear(256, out_dim)
         self.log_std_layer = nn.Linear(256, out_dim)
         self.log_std_min, self.log_std_max = log_std_min, log_std_max
 
-        init_layer_uniform(self.hidden1)
-        init_layer_uniform(self.hidden2)
-        init_layer_uniform(self.hidden3)
         init_layer_uniform(self.mu_layer)
         init_layer_uniform(self.log_std_layer)
         #############################
@@ -63,9 +59,8 @@ class Actor(nn.Module):
         """Forward method implementation."""
         
         ############TODO#############
-        x = F.relu(self.hidden1(state))
-        x = F.relu(self.hidden2(x))
-        x = F.relu(self.hidden3(x))
+        x = F.tanh(self.hidden1(state))
+        x = F.tanh(self.hidden2(x))
 
         mu = torch.tanh(self.mu_layer(x))
         log_std = self.log_std_layer(x)
@@ -88,14 +83,10 @@ class Critic(nn.Module):
 
         ############TODO#############
         # Remeber to initialize the layer weights
-        self.hidden1 = nn.Linear(in_dim, 512)
-        self.hidden2 = nn.Linear(512, 512)
-        self.hidden3 = nn.Linear(512, 256)
+        self.hidden1 = nn.Linear(in_dim, 256)
+        self.hidden2 = nn.Linear(256, 256)
         self.value_layer = nn.Linear(256, 1)
 
-        init_layer_uniform(self.hidden1)
-        init_layer_uniform(self.hidden2)
-        init_layer_uniform(self.hidden3)
         init_layer_uniform(self.value_layer)
         #############################
 
@@ -103,9 +94,8 @@ class Critic(nn.Module):
         """Forward method implementation."""
         
         ############TODO#############
-        x = F.relu(self.hidden1(state))
-        x = F.relu(self.hidden2(x))
-        x = F.relu(self.hidden3(x))
+        x = F.tanh(self.hidden1(state))
+        x = F.tanh(self.hidden2(x))
         value = self.value_layer(x)
         #############################
 
@@ -144,7 +134,12 @@ def ppo_iter(
     batch_size = states.size(0)
     for _ in range(update_epoch):
         for _ in range(batch_size // mini_batch_size):
-            rand_ids = np.random.choice(batch_size, mini_batch_size)
+            # 本來是隨機取樣可重複，為了確保每個樣本都被訓練到，改成不重複的隨機取樣
+            ids = np.random.permutation(batch_size)
+            for i in range(0, batch_size, mini_batch_size):
+                if i + mini_batch_size > batch_size:
+                    break
+                rand_ids = ids[i : i + mini_batch_size]
             yield states[rand_ids, :], actions[rand_ids], values[rand_ids], log_probs[
                 rand_ids
             ], returns[rand_ids], advantages[rand_ids]
@@ -182,6 +177,7 @@ class PPOAgent:
         self.seed = args.seed
         self.update_epoch = args.update_epoch
         self.ckpt_dir = args.ckpt_dir
+        self.eval_env = gym.make("Walker2d-v5", render_mode="rgb_array")
 
         if not os.path.exists(self.ckpt_dir):
             os.makedirs(self.ckpt_dir)
@@ -262,8 +258,7 @@ class PPOAgent:
         returns = torch.cat(returns).detach()
         values = torch.cat(self.values).detach()
         log_probs = torch.cat(self.log_probs).detach()
-        advantages = (returns - values)
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        advantages = returns - values
 
         actor_losses, critic_losses = [], []
 
@@ -334,7 +329,7 @@ class PPOAgent:
         snapshot_steps = [1000000, 1500000, 2000000, 2500000, 3000000]
         saved_snapshots = set()
 
-        for ep in tqdm(range(1, self.num_episodes)):
+        for ep in tqdm(range(1, self.num_episodes + 1)):
             score = 0
             for _ in range(self.rollout_len):
                 self.total_step += 1
@@ -402,16 +397,18 @@ class PPOAgent:
         self.is_test = True
         total_reward = 0
         for i in range(n_episodes):
-            state, _ = self.env.reset(seed=i)
+            state, _ = self.eval_env.reset(seed=i)
             state = np.expand_dims(state, axis=0)
             done = False
             while not done:
                 action = self.select_action(state)
                 action = action.reshape(self.action_dim,)
-                next_state, reward, d = self.step(action)
-                state = next_state
-                total_reward += reward[0][0]
-                done = d[0][0]
+
+                next_state, reward, terminated, truncated, _ = self.eval_env.step(action)
+                done = terminated or truncated
+                
+                state = np.expand_dims(next_state, axis=0)
+                total_reward += reward
         
         self.is_test = False
         return total_reward / n_episodes
@@ -464,7 +461,7 @@ if __name__ == "__main__":
     parser.add_argument("--actor-lr", type=float, default=3e-4)
     parser.add_argument("--critic-lr", type=float, default=3e-4)
     parser.add_argument("--discount-factor", type=float, default=0.99)
-    parser.add_argument("--num-episodes", type=int, default=1000000) # Increased to allow reaching 3M steps
+    parser.add_argument("--num-episodes", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=77)
     parser.add_argument("--entropy-weight", type=float, default=1e-2) # entropy can be disabled by setting this to 0
     parser.add_argument("--tau", type=float, default=0.95)

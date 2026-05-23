@@ -17,3 +17,7 @@ python a2c_pendulum-2.py --test --load-ckpt ./checkpoints/a2c_actor_200k.pt
 
 # ppo pendulum training
 python ppo_pendulum-3.py
+
+# ppo walker training
+python ppo_walker-3.py
+python ppo_walker-3.py --entropy-weight 1e-3 --actor-lr 1e-4 --critic-lr 1e-3
