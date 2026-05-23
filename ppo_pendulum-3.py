@@ -21,6 +21,7 @@ from torch.distributions import Normal
 import argparse
 import wandb
 from tqdm import tqdm
+import os
 
 def init_layer_uniform(layer: nn.Linear, init_w: float = 3e-3) -> nn.Linear:
     """Init uniform parameters on the single layer."""
@@ -43,16 +44,16 @@ class Actor(nn.Module):
 
         ############TODO#############
         # Remeber to initialize the layer weights
-        self.log_std_min = log_std_min
-        self.log_std_max = log_std_max
-        
         self.hidden1 = nn.Linear(in_dim, 256)
         self.hidden2 = nn.Linear(256, 512)
-        self.mu_layer = nn.Linear(512, out_dim)
-        self.log_std_layer = nn.Linear(512, out_dim)
+        self.hidden3 = nn.Linear(512, 256)
+        self.mu_layer = nn.Linear(256, out_dim)
+        self.log_std_layer = nn.Linear(256, out_dim)
+        self.log_std_min, self.log_std_max = log_std_min, log_std_max
 
         init_layer_uniform(self.hidden1)
         init_layer_uniform(self.hidden2)
+        init_layer_uniform(self.hidden3)
         init_layer_uniform(self.mu_layer)
         init_layer_uniform(self.log_std_layer)
         #############################
@@ -63,11 +64,14 @@ class Actor(nn.Module):
         ############TODO#############
         x = F.relu(self.hidden1(state))
         x = F.relu(self.hidden2(x))
-        
+        x = F.relu(self.hidden3(x))
+
         mu = torch.tanh(self.mu_layer(x)) * 2.0
         log_std = self.log_std_layer(x)
+        
+        # Clamp log_std to prevent NaN and ensure numerical stability
         log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
-        std = torch.exp(log_std)
+        std = torch.exp(log_std) + 1e-5
         
         dist = Normal(mu, std)
         action = dist.sample()
@@ -83,12 +87,14 @@ class Critic(nn.Module):
 
         ############TODO#############
         # Remeber to initialize the layer weights
-        self.hidden1 = nn.Linear(in_dim, 256)
-        self.hidden2 = nn.Linear(256, 512)
-        self.value_layer = nn.Linear(512, 1)
+        self.hidden1 = nn.Linear(in_dim, 512)
+        self.hidden2 = nn.Linear(512, 512)
+        self.hidden3 = nn.Linear(512, 256)
+        self.value_layer = nn.Linear(256, 1)
 
         init_layer_uniform(self.hidden1)
         init_layer_uniform(self.hidden2)
+        init_layer_uniform(self.hidden3)
         init_layer_uniform(self.value_layer)
         #############################
 
@@ -98,6 +104,7 @@ class Critic(nn.Module):
         ############TODO#############
         x = F.relu(self.hidden1(state))
         x = F.relu(self.hidden2(x))
+        x = F.relu(self.hidden3(x))
         value = self.value_layer(x)
         #############################
 
@@ -173,10 +180,14 @@ class PPOAgent:
         self.entropy_weight = args.entropy_weight
         self.seed = args.seed
         self.update_epoch = args.update_epoch
+        self.ckpt_dir = args.ckpt_dir
+
+        if not os.path.exists(self.ckpt_dir):
+            os.makedirs(self.ckpt_dir)
         
         # device: cpu / gpu
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(self.device)
+        print(f"Using device: {self.device}")
 
         # networks
         self.obs_dim = env.observation_space.shape[0]
@@ -231,7 +242,7 @@ class PPOAgent:
 
         return next_state, reward, done
 
-    def update_model(self, next_state: np.ndarray) -> Tuple[float, float]:
+    def update_model(self, next_state: np.ndarray) -> Tuple[float, float, float]:
         """Update the model by gradient descent."""
         next_state = torch.FloatTensor(next_state).to(self.device)
         next_value = self.critic(next_state)
@@ -303,7 +314,7 @@ class PPOAgent:
         actor_loss = sum(actor_losses) / len(actor_losses)
         critic_loss = sum(critic_losses) / len(critic_losses)
 
-        return actor_loss, critic_loss
+        return actor_loss, critic_loss, entropy
 
     def train(self):
         """Train the PPO agent."""
@@ -316,6 +327,8 @@ class PPOAgent:
         scores = []
         score = 0
         episode_count = 0
+        best_score = -float('inf')
+
         for ep in tqdm(range(1, self.num_episodes)):
             score = 0
             print("\n")
@@ -333,15 +346,59 @@ class PPOAgent:
                     state, _ = self.env.reset()
                     state = np.expand_dims(state, axis=0)
                     scores.append(score)
+
+                    wandb.log({
+                        "return": score, 
+                        "episode": episode_count
+                    }, step=self.total_step)
+
                     print(f"Episode {episode_count}: Total Reward = {score}")
                     score = 0
 
-            actor_loss, critic_loss = self.update_model(next_state)
+            actor_loss, critic_loss, entropy = self.update_model(next_state)
             actor_losses.append(actor_loss)
             critic_losses.append(critic_loss)
 
+            wandb.log({
+                "actor_loss": actor_loss,
+                "critic_loss": critic_loss,
+                "entropy": entropy,
+            }, step=self.total_step)
+
+            eval_score = self.evaluate()
+            wandb.log({"eval_score": eval_score}, step=self.total_step)
+            print(f"--- Evaluation at Episode {ep}: Average Reward = {eval_score} ---")
+
+            if eval_score > best_score and eval_score >= -500.0:
+                best_score = eval_score
+                actor_path = os.path.join(self.ckpt_dir, f"actor_best_step{self.total_step}_score{best_score:.2f}.pth")
+                critic_path = os.path.join(self.ckpt_dir, f"critic_best_step{self.total_step}_score{best_score:.2f}.pth")
+                torch.save(self.actor.state_dict(), actor_path)
+                torch.save(self.critic.state_dict(), critic_path)
+                print(f"New best score: {best_score} at Step {self.total_step}. Models saved.")
+                if eval_score >= -150.0:
+                    print("=========CONGRATULATIONS!=========")
+
         # termination
         self.env.close()
+
+    def evaluate(self, n_episodes=20):
+        """Test the agent."""
+        self.is_test = True
+        total_reward = 0
+        for i in range(n_episodes):
+            state, _ = self.env.reset(seed=i)
+            state = np.expand_dims(state, axis=0)
+            done = False
+            while not done:
+                action = self.select_action(state)
+                next_state, reward, d = self.step(action)
+                state = next_state
+                total_reward += reward[0][0]
+                done = d[0][0]
+        
+        self.is_test = False
+        return total_reward / n_episodes
 
     def test(self, video_folder: str):
         """Test the agent."""
@@ -391,6 +448,7 @@ if __name__ == "__main__":
     parser.add_argument("--epsilon", type=float, default=0.2)
     parser.add_argument("--rollout-len", type=int, default=2000)
     parser.add_argument("--update-epoch", type=int, default=64)
+    parser.add_argument("--ckpt-dir",           type=str,   default="./task2_checkpoints")
     args = parser.parse_args()
  
     # environment

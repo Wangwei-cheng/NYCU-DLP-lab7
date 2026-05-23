@@ -3,5 +3,6 @@ wandb/
 *.pt
 *.pth
 checkpoints/
+task2_checkpoints/
 videos/
 *.mp4

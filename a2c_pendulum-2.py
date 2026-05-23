@@ -188,19 +188,18 @@ class A2CAgent:
         done = terminated or truncated
 
         if not self.is_test:
-            # Reward scaling for better stability in Pendulum
-            # scaled_reward = reward / 10.0
-            self.transition.extend([next_state, reward, done])
+            # return terminated rather than done for better value estimation in truncated episodes
+            self.transition.extend([next_state, reward, terminated])
 
         return next_state, reward, done
 
     def update_model(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Update the model by gradient descent."""
-        state, log_prob, next_state, reward, done = self.transition
+        state, log_prob, next_state, reward, terminated = self.transition
 
         # Q_t   = r + gamma * V(s_{t+1})  if state != Terminal
         #       = r                       otherwise
-        mask = 1 - done
+        mask = 1 - int(terminated)
 
         ############TODO#############
         # value_loss = ?
@@ -303,28 +302,13 @@ class A2CAgent:
                 eval_score = self.evaluate()
                 wandb.log({"eval_return": eval_score})
                 print(f"--- Evaluation at Episode {ep}: Average Reward = {eval_score} ---")
-                if eval_score >= -150.0:
-                    succes_actor_path = os.path.join(self.ckpt_dir, f"a2c_actor_pass_{step_count}.pt")
-                    succes_critic_path = os.path.join(self.ckpt_dir, f"a2c_critic_pass_{step_count}.pt")
-                    torch.save(self.actor.state_dict(), succes_actor_path)
-                    torch.save(self.critic.state_dict(), succes_critic_path)
-                    print(f"CONGRATULATIONS! Saved model for passing score at step {step_count}!")
                 if eval_score > best_score:
                     best_score = eval_score
-                    torch.save(self.actor.state_dict(), os.path.join(self.ckpt_dir, "a2c_actor_best.pt"))
-                    torch.save(self.critic.state_dict(), os.path.join(self.ckpt_dir, "a2c_critic_best.pt"))
-                    print(f"New Best Model Saved! Score: {best_score}")
-
-            # Check for 50k step checkpoint
-            if step_count // 50000 > last_ckpt_step // 50000:
-                last_ckpt_step = (step_count // 50000) * 50000
-                suffix = f"{last_ckpt_step // 1000}k"
-                best_actor_path = os.path.join(self.ckpt_dir, "a2c_actor_best.pt")
-                best_critic_path = os.path.join(self.ckpt_dir, "a2c_critic_best.pt")
-                if os.path.exists(best_actor_path) and os.path.exists(best_critic_path):
-                    shutil.copy(best_actor_path, os.path.join(self.ckpt_dir, f"a2c_actor_{suffix}.pt"))
-                    shutil.copy(best_critic_path, os.path.join(self.ckpt_dir, f"a2c_critic_{suffix}.pt"))
-                    print(f"Saved copy of best model at {suffix} steps.")
+                    torch.save(self.actor.state_dict(), os.path.join(self.ckpt_dir, f"a2c_actor_best_step{step_count}.pt"))
+                    torch.save(self.critic.state_dict(), os.path.join(self.ckpt_dir, f"a2c_critic_best_step{step_count}.pt"))
+                    print(f"New Best Model Saved! Score: {best_score} at Step {step_count}.")
+                    if eval_score >= -150.0:
+                        print("=========CONGRATULATIONS!=========")
 
     def evaluate(self, n_episodes=20):
         """Evaluate the agent for n_episodes."""
@@ -357,9 +341,7 @@ class A2CAgent:
 
             while not done:
                 action = self.select_action(state)
-                next_state, reward, terminated, truncated = self.step(action)
-                done = terminated or truncated
-
+                next_state, reward, done = self.step(action)
                 state = next_state
                 score += reward
             
