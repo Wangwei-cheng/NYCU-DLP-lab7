@@ -6,6 +6,8 @@
 # Contributors: Kai-Siang Ma and Alison Wen
 # Instructor: Ping-Chun Hsieh
 
+import os
+import shutil
 import random
 from collections import deque
 from typing import Deque, List, Tuple
@@ -43,14 +45,37 @@ class Actor(nn.Module):
 
         ############TODO#############
         # Remeber to initialize the layer weights
-        
+        self.hidden1 = nn.Linear(in_dim, 256)
+        self.hidden2 = nn.Linear(256, 512)
+        self.hidden3 = nn.Linear(512, 256)
+        self.mu_layer = nn.Linear(256, out_dim)
+        self.log_std_layer = nn.Linear(256, out_dim)
+        self.log_std_min, self.log_std_max = log_std_min, log_std_max
+
+        init_layer_uniform(self.hidden1)
+        init_layer_uniform(self.hidden2)
+        init_layer_uniform(self.hidden3)
+        init_layer_uniform(self.mu_layer)
+        init_layer_uniform(self.log_std_layer)
         #############################
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         """Forward method implementation."""
         
         ############TODO#############
+        x = F.relu(self.hidden1(state))
+        x = F.relu(self.hidden2(x))
+        x = F.relu(self.hidden3(x))
 
+        mu = torch.tanh(self.mu_layer(x))
+        log_std = self.log_std_layer(x)
+        
+        # Clamp log_std to prevent NaN and ensure numerical stability
+        log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
+        std = torch.exp(log_std) + 1e-5
+        
+        dist = Normal(mu, std)
+        action = dist.sample()
         #############################
 
         return action, dist
@@ -63,14 +88,25 @@ class Critic(nn.Module):
 
         ############TODO#############
         # Remeber to initialize the layer weights
-        
+        self.hidden1 = nn.Linear(in_dim, 512)
+        self.hidden2 = nn.Linear(512, 512)
+        self.hidden3 = nn.Linear(512, 256)
+        self.value_layer = nn.Linear(256, 1)
+
+        init_layer_uniform(self.hidden1)
+        init_layer_uniform(self.hidden2)
+        init_layer_uniform(self.hidden3)
+        init_layer_uniform(self.value_layer)
         #############################
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         """Forward method implementation."""
         
         ############TODO#############
-
+        x = F.relu(self.hidden1(state))
+        x = F.relu(self.hidden2(x))
+        x = F.relu(self.hidden3(x))
+        value = self.value_layer(x)
         #############################
 
         return value
@@ -80,7 +116,15 @@ def compute_gae(
     """Compute gae."""
 
     ############TODO#############
-
+    values = values + [next_value]
+    gae = 0
+    returns = []
+    
+    for step in reversed(range(len(rewards))):
+        delta = rewards[step] + gamma * values[step + 1] * masks[step] - values[step]
+        gae = delta + gamma * tau * masks[step] * gae
+        returns.insert(0, gae + values[step])
+    gae_returns = returns
     #############################
     return gae_returns
 
@@ -137,10 +181,14 @@ class PPOAgent:
         self.entropy_weight = args.entropy_weight
         self.seed = args.seed
         self.update_epoch = args.update_epoch
+        self.ckpt_dir = args.ckpt_dir
+
+        if not os.path.exists(self.ckpt_dir):
+            os.makedirs(self.ckpt_dir)
         
         # device: cpu / gpu
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(self.device)
+        print(f"Using device: {self.device}")
 
         # networks
         self.obs_dim = env.observation_space.shape[0]
@@ -149,8 +197,8 @@ class PPOAgent:
         self.critic = Critic(self.obs_dim).to(self.device)
 
         # optimizer
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=0.001)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=0.005)
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=args.actor_lr)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=args.critic_lr)
 
         # memory for training
         self.states: List[torch.Tensor] = []
@@ -195,7 +243,7 @@ class PPOAgent:
 
         return next_state, reward, done
 
-    def update_model(self, next_state: np.ndarray) -> Tuple[float, float]:
+    def update_model(self, next_state: np.ndarray) -> Tuple[float, float, float]:
         """Update the model by gradient descent."""
         next_state = torch.FloatTensor(next_state).to(self.device)
         next_value = self.critic(next_state)
@@ -214,7 +262,8 @@ class PPOAgent:
         returns = torch.cat(returns).detach()
         values = torch.cat(self.values).detach()
         log_probs = torch.cat(self.log_probs).detach()
-        advantages = returns - values
+        advantages = (returns - values)
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         actor_losses, critic_losses = [], []
 
@@ -236,13 +285,16 @@ class PPOAgent:
             # actor_loss
             ############TODO#############
             # actor_loss = ?
-            
+            entropy = dist.entropy().mean()
+            surr1 = ratio * adv
+            surr2 = torch.clamp(ratio, 1.0 - self.epsilon, 1.0 + self.epsilon) * adv
+            actor_loss = -torch.min(surr1, surr2).mean() - self.entropy_weight * entropy
             #############################
 
             # critic_loss
             ############TODO#############
             # critic_loss = ?
-
+            critic_loss = F.mse_loss(self.critic(state), return_)
             #############################
             
             # train critic
@@ -264,7 +316,7 @@ class PPOAgent:
         actor_loss = sum(actor_losses) / len(actor_losses)
         critic_loss = sum(critic_losses) / len(critic_losses)
 
-        return actor_loss, critic_loss
+        return actor_loss, critic_loss, entropy
 
     def train(self):
         """Train the PPO agent."""
@@ -277,9 +329,13 @@ class PPOAgent:
         scores = []
         score = 0
         episode_count = 0
+        best_score = -float('inf')
+        
+        snapshot_steps = [1000000, 1500000, 2000000, 2500000, 3000000]
+        saved_snapshots = set()
+
         for ep in tqdm(range(1, self.num_episodes)):
             score = 0
-            print("\n")
             for _ in range(self.rollout_len):
                 self.total_step += 1
                 action = self.select_action(state)
@@ -295,15 +351,78 @@ class PPOAgent:
                     state, _ = self.env.reset()
                     state = np.expand_dims(state, axis=0)
                     scores.append(score)
+                    
+                    wandb.log({
+                        "return": score, 
+                        "episode": episode_count
+                    }, step=self.total_step)
+                    
                     print(f"Episode {episode_count}: Total Reward = {score}")
                     score = 0
 
-            actor_loss, critic_loss = self.update_model(next_state)
+                # Check for snapshots
+                for s_step in snapshot_steps:
+                    if self.total_step >= s_step and s_step not in saved_snapshots:
+                        best_model_path = os.path.join(self.ckpt_dir, "task3_best.pt")
+                        snapshot_path = os.path.join(self.ckpt_dir, f"task3_ppo_{s_step}.pt")
+                        if os.path.exists(best_model_path):
+                            shutil.copy(best_model_path, snapshot_path)
+                            print(f"Copied best model to {snapshot_path}")
+                        else:
+                            self.save_model(f"task3_ppo_{s_step}.pt")
+                            print(f"Saved current model to {snapshot_path}")
+                        saved_snapshots.add(s_step)
+
+            actor_loss, critic_loss, entropy = self.update_model(next_state)
             actor_losses.append(actor_loss)
             critic_losses.append(critic_loss)
 
+            wandb.log({
+                "actor_loss": actor_loss,
+                "critic_loss": critic_loss,
+                "entropy": entropy,
+            }, step=self.total_step)
+
+            eval_score = self.evaluate()
+            wandb.log({"eval_score": eval_score}, step=self.total_step)
+            print(f"--- Evaluation at Step {self.total_step}: Average Reward = {eval_score} ---")
+
+            if eval_score > best_score:
+                best_score = eval_score
+                self.save_model("task3_best.pt")
+                print(f"New best score: {best_score} at Step {self.total_step}. Models saved.")
+                if eval_score >= 2500.0:
+                    print("=========CONGRATULATIONS!=========")
+
         # termination
         self.env.close()
+
+    def evaluate(self, n_episodes=20):
+        """Evaluate the agent."""
+        self.is_test = True
+        total_reward = 0
+        for i in range(n_episodes):
+            state, _ = self.env.reset(seed=i)
+            state = np.expand_dims(state, axis=0)
+            done = False
+            while not done:
+                action = self.select_action(state)
+                action = action.reshape(self.action_dim,)
+                next_state, reward, d = self.step(action)
+                state = next_state
+                total_reward += reward[0][0]
+                done = d[0][0]
+        
+        self.is_test = False
+        return total_reward / n_episodes
+
+    def save_model(self, filename: str):
+        """Save model parameters."""
+        path = os.path.join(self.ckpt_dir, filename)
+        torch.save({
+            'actor_state_dict': self.actor.state_dict(),
+            'critic_state_dict': self.critic.state_dict(),
+        }, path)
 
     def test(self, video_folder: str):
         """Test the agent."""
@@ -345,7 +464,7 @@ if __name__ == "__main__":
     parser.add_argument("--actor-lr", type=float, default=3e-4)
     parser.add_argument("--critic-lr", type=float, default=3e-4)
     parser.add_argument("--discount-factor", type=float, default=0.99)
-    parser.add_argument("--num-episodes", type=int, default=1000)
+    parser.add_argument("--num-episodes", type=int, default=1000000) # Increased to allow reaching 3M steps
     parser.add_argument("--seed", type=int, default=77)
     parser.add_argument("--entropy-weight", type=float, default=1e-2) # entropy can be disabled by setting this to 0
     parser.add_argument("--tau", type=float, default=0.95)
@@ -353,11 +472,12 @@ if __name__ == "__main__":
     parser.add_argument("--epsilon", type=float, default=0.2)
     parser.add_argument("--rollout-len", type=int, default=2000)
     parser.add_argument("--update-epoch", type=int, default=10)
+    parser.add_argument("--ckpt-dir", type=str, default="./task3_checkpoints")
     args = parser.parse_args()
  
     # environment
     env = gym.make("Walker2d-v5", render_mode="rgb_array")
-    seed = 77
+    seed = args.seed
     random.seed(seed)
     np.random.seed(seed)
     seed_torch(seed)
