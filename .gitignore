@@ -3,6 +3,7 @@ wandb/
 *.pt
 *.pth
 checkpoints/
+task1_checkpoints/
 task2_checkpoints/
 task3_checkpoints/
 videos/

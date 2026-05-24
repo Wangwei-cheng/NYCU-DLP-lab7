@@ -134,6 +134,7 @@ class A2CAgent:
         self.entropy_weight_decay = args.ewd
         self.lr_annealing = args.lra
         self.ew_min = args.ew_min
+        self.eval_env = gym.make("Pendulum-v1")
 
         if not os.path.exists(self.ckpt_dir):
             os.makedirs(self.ckpt_dir)
@@ -193,7 +194,7 @@ class A2CAgent:
 
         return next_state, reward, done
 
-    def update_model(self) -> Tuple[torch.Tensor, torch.Tensor]:
+    def update_model(self) -> Tuple[torch.Tensor, torch.Tensor, float]:
         """Update the model by gradient descent."""
         state, log_prob, next_state, reward, terminated = self.transition
 
@@ -218,6 +219,7 @@ class A2CAgent:
         # update value
         self.critic_optimizer.zero_grad()
         value_loss.backward()
+        nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=0.5)
         self.critic_optimizer.step()
 
         # advantage = Q_t - V(s_t)
@@ -227,22 +229,22 @@ class A2CAgent:
         
         # Calculate entropy for exploration
         _, dist = self.actor(state)
-        entropy = dist.entropy().sum(-1)
+        entropy = dist.entropy().sum(dim=-1, keepdim=True).mean()
         
         policy_loss = - (log_prob * advantage + self.entropy_weight * entropy)
         #############################
         # update policy
         self.actor_optimizer.zero_grad()
         policy_loss.backward()
+        nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=0.5)
         self.actor_optimizer.step()
 
-        return policy_loss.item(), value_loss.item()
+        return policy_loss.item(), value_loss.item(), entropy
 
     def train(self):
         """Train the agent."""
         self.is_test = False
         step_count = 0
-        last_ckpt_step = 0
         best_score = -float('inf')
         
         # Initial entropy weight if decay is enabled
@@ -270,7 +272,7 @@ class A2CAgent:
                 action = self.select_action(state)
                 next_state, reward, done = self.step(action)
 
-                actor_loss, critic_loss = self.update_model()
+                actor_loss, critic_loss, entropy = self.update_model()
                 actor_losses.append(actor_loss)
                 critic_losses.append(critic_loss)
 
@@ -280,17 +282,17 @@ class A2CAgent:
 
                 # W&B logging
                 wandb.log({
-                    "step": step_count,
                     "actor loss": actor_loss,
                     "critic loss": critic_loss,
                     "actor_lr": curr_actor_lr,
-                    "entropy_weight": self.entropy_weight
-                }) 
+                    "entropy_weight": self.entropy_weight,
+                    "entropy": entropy
+                }, step=step_count) 
                 # if episode ends
                 if done:
                     scores.append(score)
-                    print(f"Episode {ep}: Total Reward = {score}")
-                    wandb.log({"episode": ep, "return": score})
+                    tqdm.write(f"Episode {ep}: Total Reward = {score}")
+                    wandb.log({"return": score}, step=step_count)
             
             # Step the schedulers at the end of each episode
             if self.lr_annealing:
@@ -300,26 +302,30 @@ class A2CAgent:
             # Evaluation every 20 episodes
             if ep % 20 == 0:
                 eval_score = self.evaluate()
-                wandb.log({"eval_return": eval_score})
-                print(f"--- Evaluation at Episode {ep}: Average Reward = {eval_score} ---")
-                if eval_score > best_score:
+                wandb.log({"eval_return": eval_score}, step=step_count)
+                tqdm.write(f"--- Evaluation at Episode {ep}: Average Reward = {eval_score} ---")
+                if eval_score > best_score and eval_score >= -300.0:
                     best_score = eval_score
-                    torch.save(self.actor.state_dict(), os.path.join(self.ckpt_dir, f"a2c_actor_best_step{step_count}.pt"))
-                    torch.save(self.critic.state_dict(), os.path.join(self.ckpt_dir, f"a2c_critic_best_step{step_count}.pt"))
-                    print(f"New Best Model Saved! Score: {best_score} at Step {step_count}.")
+                    path = os.path.join(self.ckpt_dir, f"step_{step_count}_score_{eval_score}.pt")
+                    torch.save({
+                        "actor_state_dict": self.actor.state_dict(),
+                        "critic_state_dict": self.critic.state_dict(),
+                    }, path)
+                    tqdm.write(f"New Best Score: {best_score} at Step {step_count}. Model saved.")
                     if eval_score >= -150.0:
-                        print("=========CONGRATULATIONS!=========")
+                        tqdm.write("=========CONGRATULATIONS!=========")
 
     def evaluate(self, n_episodes=20):
         """Evaluate the agent for n_episodes."""
         self.is_test = True
         total_reward = 0
         for i in range(n_episodes):
-            state, _ = self.env.reset(seed=i)
+            state, _ = self.eval_env.reset(seed=i)
             done = False
             while not done:
                 action = self.select_action(state)
-                next_state, reward, done = self.step(action)
+                next_state, reward, terminated, truncated, _ = self.eval_env.step(action)
+                done = terminated or truncated
                 state = next_state
                 total_reward += reward
         
@@ -367,11 +373,11 @@ if __name__ == "__main__":
     parser.add_argument("--actor-lr",           type=float, default=1e-4)
     parser.add_argument("--critic-lr",          type=float, default=1e-3)
     parser.add_argument("--discount-factor",    type=float, default=0.9)
-    parser.add_argument("--num-episodes",       type=int,   default=1000)
+    parser.add_argument("--num-episodes",       type=int,   default=1500)
     parser.add_argument("--seed",               type=int,   default=77)
     parser.add_argument("--entropy-weight",     type=float, default=1e-2) # entropy can be disabled by setting this to 0
-    parser.add_argument("--ckpt-dir",           type=str,   default="./checkpoints")
-    parser.add_argument("--video-dir",          type=str,   default="./videos")
+    parser.add_argument("--ckpt-dir",           type=str,   default="./task1_checkpoints")
+    parser.add_argument("--video-dir",          type=str,   default="./task1_videos")
     parser.add_argument("--load-ckpt",          type=str)
     parser.add_argument("--ew-min",             type=float, default=1e-3)
 
@@ -381,15 +387,17 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     # environment
-    env = gym.make("Pendulum-v1", render_mode="rgb_array")
-    seed = 77
+    env = gym.make("Pendulum-v1")
+    seed = args.seed
     random.seed(seed)
     np.random.seed(seed)
     seed_torch(seed)
     
     if args.test:
         agent = A2CAgent(env, args)
-        agent.actor.load_state_dict(torch.load(args.load_ckpt))
+        ckpt = torch.load(args.load_ckpt, map_location=agent.device)
+        agent.actor.load_state_dict(ckpt['actor_state_dict'])
+        agent.critic.load_state_dict(ckpt['critic_state_dict'])
         env_step = args.load_ckpt.split('_')[-1].split('.')[0]
         agent.test(args.video_dir, env_step)
     else:
