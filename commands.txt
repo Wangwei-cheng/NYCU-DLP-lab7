@@ -16,11 +16,17 @@ python a2c_pendulum-2.py --ew-min 0.0005 --ewd --lra
 
 
 # a2c testing
-python a2c_pendulum-2.py --test --load-ckpt ./checkpoints/a2c_actor_200k.pt
+python a2c_pendulum-2.py --test --load-ckpt ./task1_checkpoints/step_140000_score_-142.19356970477114.pt
 
 # ppo pendulum training
 python ppo_pendulum-3.py
 
+# ppo pendulum testing
+python ppo_pendulum-3.py --test --load-ckpt ./task2_checkpoints/step_138001_score_[-145.74960768].pt
+
 # ppo walker training
 python ppo_walker-3.py
 python ppo_walker-3.py --entropy-weight 1e-3 --actor-lr 1e-4 --critic-lr 1e-4
+
+# ppo walker testing
+python ppo_walker-3.py --test --load-ckpt ./task3_checkpoints/task3_ppo_1000000.pt

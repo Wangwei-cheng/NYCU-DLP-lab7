@@ -45,15 +45,11 @@ class Actor(nn.Module):
         ############TODO#############
         # Remeber to initialize the layer weights
         self.hidden1 = nn.Linear(in_dim, 256)
-        self.hidden2 = nn.Linear(256, 512)
-        self.hidden3 = nn.Linear(512, 256)
+        self.hidden2 = nn.Linear(256, 256)
         self.mu_layer = nn.Linear(256, out_dim)
         self.log_std_layer = nn.Linear(256, out_dim)
         self.log_std_min, self.log_std_max = log_std_min, log_std_max
 
-        init_layer_uniform(self.hidden1)
-        init_layer_uniform(self.hidden2)
-        init_layer_uniform(self.hidden3)
         init_layer_uniform(self.mu_layer)
         init_layer_uniform(self.log_std_layer)
         #############################
@@ -64,7 +60,6 @@ class Actor(nn.Module):
         ############TODO#############
         x = F.relu(self.hidden1(state))
         x = F.relu(self.hidden2(x))
-        x = F.relu(self.hidden3(x))
 
         mu = torch.tanh(self.mu_layer(x)) * 2.0
         log_std = self.log_std_layer(x)
@@ -87,14 +82,13 @@ class Critic(nn.Module):
 
         ############TODO#############
         # Remeber to initialize the layer weights
-        self.hidden1 = nn.Linear(in_dim, 512)
-        self.hidden2 = nn.Linear(512, 512)
-        self.hidden3 = nn.Linear(512, 256)
+        self.hidden1 = nn.Linear(in_dim, 256)
+        self.hidden2 = nn.Linear(256, 256)
         self.value_layer = nn.Linear(256, 1)
 
-        init_layer_uniform(self.hidden1)
-        init_layer_uniform(self.hidden2)
-        init_layer_uniform(self.hidden3)
+        # init_layer_uniform(self.hidden1)
+        # init_layer_uniform(self.hidden2)
+        # init_layer_uniform(self.hidden3)
         init_layer_uniform(self.value_layer)
         #############################
 
@@ -104,7 +98,6 @@ class Critic(nn.Module):
         ############TODO#############
         x = F.relu(self.hidden1(state))
         x = F.relu(self.hidden2(x))
-        x = F.relu(self.hidden3(x))
         value = self.value_layer(x)
         #############################
 
@@ -142,11 +135,21 @@ def ppo_iter(
     """Get mini-batches."""
     batch_size = states.size(0)
     for _ in range(update_epoch):
-        for _ in range(batch_size // mini_batch_size):
-            rand_ids = np.random.choice(batch_size, mini_batch_size)
-            yield states[rand_ids, :], actions[rand_ids], values[rand_ids], log_probs[
-                rand_ids
-            ], returns[rand_ids], advantages[rand_ids]
+        # 本來是隨機取樣可重複，為了確保每個樣本都被訓練到，改成不重複的隨機取樣
+        ids = np.random.permutation(batch_size)
+        for start in range(0, batch_size, mini_batch_size):
+            end = start + mini_batch_size
+            if end > batch_size:
+                end = batch_size
+            rand_ids = ids[start:end]
+            yield (
+                states[rand_ids, :], 
+                actions[rand_ids], 
+                values[rand_ids], 
+                log_probs[rand_ids], 
+                returns[rand_ids], 
+                advantages[rand_ids]
+            )
 
 class PPOAgent:
     """PPO Agent.
@@ -181,6 +184,7 @@ class PPOAgent:
         self.seed = args.seed
         self.update_epoch = args.update_epoch
         self.ckpt_dir = args.ckpt_dir
+        self.eval_env = gym.make("Pendulum-v1")
 
         if not os.path.exists(self.ckpt_dir):
             os.makedirs(self.ckpt_dir)
@@ -216,15 +220,19 @@ class PPOAgent:
     def select_action(self, state: np.ndarray) -> np.ndarray:
         """Select an action from the input state."""
         state = torch.FloatTensor(state).to(self.device)
-        action, dist = self.actor(state)
-        selected_action = dist.mean if self.is_test else action
+        with torch.no_grad():
+            action, dist = self.actor(state)
+            selected_action = dist.mean if self.is_test else action
+            selected_action = selected_action.clamp(-2.0, 2.0)
 
-        if not self.is_test:
-            value = self.critic(state)
-            self.states.append(state)
-            self.actions.append(selected_action)
-            self.values.append(value)
-            self.log_probs.append(dist.log_prob(selected_action))
+            if not self.is_test:
+                value = self.critic(state)
+                self.states.append(state)
+                self.actions.append(selected_action)
+                self.values.append(value)
+                # joint propability
+            log_prob = dist.log_prob(selected_action).sum(dim=-1, keepdim=True)
+            self.log_probs.append(log_prob)
 
         return selected_action.cpu().detach().numpy()
 
@@ -277,7 +285,8 @@ class PPOAgent:
         ):
             # calculate ratios
             _, dist = self.actor(state)
-            log_prob = dist.log_prob(action)
+            # joint propability
+            log_prob = dist.log_prob(action).sum(dim=-1, keepdim=True)
             ratio = (log_prob - old_log_prob).exp()
 
             # actor_loss
@@ -298,11 +307,13 @@ class PPOAgent:
             # train critic
             self.critic_optimizer.zero_grad()
             critic_loss.backward(retain_graph=True)
+            nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=0.5)
             self.critic_optimizer.step()
 
             # train actor
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
+            nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=0.5)
             self.actor_optimizer.step()
 
             actor_losses.append(actor_loss.item())
@@ -347,10 +358,7 @@ class PPOAgent:
                     state = np.expand_dims(state, axis=0)
                     scores.append(score)
 
-                    wandb.log({
-                        "return": score, 
-                        "episode": episode_count
-                    }, step=self.total_step)
+                    wandb.log({"return": score}, step=self.total_step)
 
                     print(f"Episode {episode_count}: Total Reward = {score}")
                     score = 0
@@ -367,17 +375,18 @@ class PPOAgent:
 
             eval_score = self.evaluate()
             wandb.log({"eval_score": eval_score}, step=self.total_step)
-            print(f"--- Evaluation at Episode {ep}: Average Reward = {eval_score} ---")
+            tqdm.write(f"--- Evaluation at Episode {ep}: Average Reward = {eval_score} ---")
 
-            if eval_score > best_score and eval_score >= -500.0:
+            if eval_score > best_score and eval_score >= -160.0:
                 best_score = eval_score
-                actor_path = os.path.join(self.ckpt_dir, f"actor_best_step{self.total_step}_score{best_score:.2f}.pth")
-                critic_path = os.path.join(self.ckpt_dir, f"critic_best_step{self.total_step}_score{best_score:.2f}.pth")
-                torch.save(self.actor.state_dict(), actor_path)
-                torch.save(self.critic.state_dict(), critic_path)
-                print(f"New best score: {best_score} at Step {self.total_step}. Models saved.")
+                path = os.path.join(self.ckpt_dir, f"step_{self.total_step}_score_{eval_score}.pt")
+                torch.save({
+                    "actor_state_dict": self.actor.state_dict(),
+                    "critic_state_dict": self.critic.state_dict(),
+                }, path)
+                tqdm.write(f"New Best Score: {best_score} at Step {self.total_step}. Model saved.")
                 if eval_score >= -150.0:
-                    print("=========CONGRATULATIONS!=========")
+                    tqdm.write("=========CONGRATULATIONS!=========")
 
         # termination
         self.env.close()
@@ -387,20 +396,20 @@ class PPOAgent:
         self.is_test = True
         total_reward = 0
         for i in range(n_episodes):
-            state, _ = self.env.reset(seed=i)
+            state, _ = self.eval_env.reset(seed=i)
             state = np.expand_dims(state, axis=0)
             done = False
             while not done:
                 action = self.select_action(state)
-                next_state, reward, d = self.step(action)
-                state = next_state
-                total_reward += reward[0][0]
-                done = d[0][0]
+                next_state, reward, terminated, truncated, _ = self.eval_env.step(action)
+                done = terminated or truncated
+                state = np.reshape(next_state, (1, -1)).astype(np.float64)
+                total_reward += reward
         
         self.is_test = False
         return total_reward / n_episodes
 
-    def test(self, video_folder: str):
+    def test(self, video_folder: str, env_step: str):
         """Test the agent."""
         self.is_test = True
 
@@ -410,18 +419,21 @@ class PPOAgent:
         scores = []
         for i in range(20):
             state, _ = self.env.reset(seed=i)
+            state = np.expand_dims(state, axis=0)
             done = False
             score = 0
 
             while not done:
                 action = self.select_action(state)
-                next_state, reward, done = self.step(action)
+                action = action.reshape(self.action_dim,)
+                next_state, reward, d = self.step(action)
 
                 state = next_state
-                score += reward
+                score += reward[0][0]
+                done = d[0][0]
             
             scores.append(score)
-            print(f"Episode {i}: score = {score}")
+            print(f"Env Step: {env_step}, Seed: {i}, score = {score}")
 
         print("Average score: ", np.mean(scores))
         self.env.close()
@@ -440,7 +452,7 @@ if __name__ == "__main__":
     parser.add_argument("--actor-lr", type=float, default=1e-4)
     parser.add_argument("--critic-lr", type=float, default=1e-3)
     parser.add_argument("--discount-factor", type=float, default=0.9)
-    parser.add_argument("--num-episodes", type=int, default=1000)
+    parser.add_argument("--num-episodes", type=int, default=150)
     parser.add_argument("--seed", type=int, default=77)
     parser.add_argument("--entropy-weight", type=float, default=1e-2) # entropy can be disabled by setting this to 0
     parser.add_argument("--tau", type=float, default=0.8)
@@ -449,15 +461,28 @@ if __name__ == "__main__":
     parser.add_argument("--rollout-len", type=int, default=2000)
     parser.add_argument("--update-epoch", type=int, default=64)
     parser.add_argument("--ckpt-dir",           type=str,   default="./task2_checkpoints")
+
+    parser.add_argument("--test",               action="store_true")
+    parser.add_argument("--video-dir",          type=str,   default="./task2_videos")
+    parser.add_argument("--load-ckpt",          type=str)
     args = parser.parse_args()
  
     # environment
-    env = gym.make("Pendulum-v1", render_mode="rgb_array")
-    seed = 77
+    env = gym.make("Pendulum-v1", render_mode="rgb_array") if args.test else gym.make("Pendulum-v1")
+    seed = args.seed
     random.seed(seed)
     np.random.seed(seed)
     seed_torch(seed)
-    wandb.init(project="DLP-Lab7-PPO-Pendulum", name=args.wandb_run_name, save_code=True)
-    
-    agent = PPOAgent(env, args)
-    agent.train()
+
+    if args.test and args.load_ckpt is not None:
+        agent = PPOAgent(env, args)
+        ckpt = torch.load(args.load_ckpt, map_location=agent.device)
+        agent.actor.load_state_dict(ckpt['actor_state_dict'])
+        agent.critic.load_state_dict(ckpt['critic_state_dict'])
+        env_step = args.load_ckpt.split('/')[2].split('_')[1]
+        agent.test(args.video_dir, env_step)
+    else:
+        wandb.init(project="DLP-Lab7-PPO-Pendulum", name=args.wandb_run_name, save_code=True)
+        
+        agent = PPOAgent(env, args)
+        agent.train()

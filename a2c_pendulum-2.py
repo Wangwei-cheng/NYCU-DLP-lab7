@@ -175,7 +175,7 @@ class A2CAgent:
                 self.critic_optimizer, T_max=self.num_episodes, eta_min=self.critic_lr * 0.1
             )
 
-        # transition (state, log_prob, next_state, reward, done)
+        # transition (state, log_prob, entropy, next_state, reward, terminated)
         self.transition: list = list()
 
         # total steps count
@@ -315,7 +315,7 @@ class A2CAgent:
                 eval_score = self.evaluate()
                 wandb.log({"eval_return": eval_score}, step=step_count)
                 tqdm.write(f"--- Evaluation at Episode {ep}: Average Reward = {eval_score} ---")
-                if eval_score > best_score and eval_score >= -200.0:
+                if eval_score > best_score and eval_score >= -160.0:
                     best_score = eval_score
                     path = os.path.join(self.ckpt_dir, f"step_{step_count}_score_{eval_score}.pt")
                     torch.save({
@@ -348,7 +348,7 @@ class A2CAgent:
         self.is_test = True
 
         tmp_env = self.env
-        self.env = gym.wrappers.RecordVideo(self.env, video_folder=video_folder, episode_trigger=lambda x: x == 0)
+        self.env = gym.wrappers.RecordVideo(self.env, video_folder=video_folder)
 
         scores = []
         for i in range(20):
@@ -384,7 +384,7 @@ if __name__ == "__main__":
     parser.add_argument("--actor-lr",           type=float, default=1e-4)
     parser.add_argument("--critic-lr",          type=float, default=1e-3)
     parser.add_argument("--discount-factor",    type=float, default=0.9)
-    parser.add_argument("--num-episodes",       type=int,   default=1500)
+    parser.add_argument("--num-episodes",       type=int,   default=150)
     parser.add_argument("--seed",               type=int,   default=77)
     parser.add_argument("--entropy-weight",     type=float, default=1e-2) # entropy can be disabled by setting this to 0
     parser.add_argument("--ckpt-dir",           type=str,   default="./task1_checkpoints")
@@ -399,6 +399,8 @@ if __name__ == "__main__":
     
     # environment
     env = gym.make("Pendulum-v1")
+    if args.test:
+        env = gym.make("Pendulum-v1", render_mode="rgb_array")
     seed = args.seed
     random.seed(seed)
     np.random.seed(seed)
@@ -409,7 +411,7 @@ if __name__ == "__main__":
         ckpt = torch.load(args.load_ckpt, map_location=agent.device)
         agent.actor.load_state_dict(ckpt['actor_state_dict'])
         agent.critic.load_state_dict(ckpt['critic_state_dict'])
-        env_step = args.load_ckpt.split('_')[-1].split('.')[0]
+        env_step = args.load_ckpt.split('/')[2].split('_')[1]
         agent.test(args.video_dir, env_step)
     else:
         with_lra = "_lra" if args.lra else ""

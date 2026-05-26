@@ -436,7 +436,7 @@ class PPOAgent:
             'critic_state_dict': self.critic.state_dict(),
         }, path)
 
-    def test(self, video_folder: str):
+    def test(self, video_folder: str, env_step: str):
         """Test the agent."""
         self.is_test = True
 
@@ -446,19 +446,21 @@ class PPOAgent:
         scores = []
         for i in range(20):
             state, _ = self.env.reset(seed=i)
+            state = np.expand_dims(state, axis=0)
             done = False
             score = 0
 
             while not done:
                 action = self.select_action(state)
                 clipped_action = np.clip(action, -1.0, 1.0)
-                next_state, reward, done = self.step(clipped_action)
+                next_state, reward, d = self.step(clipped_action)
 
                 state = next_state
-                score += reward
+                score += reward[0][0]
+                done = d[0][0]
             
             scores.append(score)
-            print(f"Episode {i}: score = {score}")
+            print(f"Env Step: {env_step}, Seed: {i}, score = {score}")
 
         print("Average score: ", np.mean(scores))
         self.env.close()
@@ -486,15 +488,28 @@ if __name__ == "__main__":
     parser.add_argument("--rollout-len", type=int, default=2000)
     parser.add_argument("--update-epoch", type=int, default=10)
     parser.add_argument("--ckpt-dir", type=str, default="./task3_checkpoints")
+
+    parser.add_argument("--test",               action="store_true")
+    parser.add_argument("--video-dir",          type=str,   default="./task3_videos")
+    parser.add_argument("--load-ckpt",          type=str)
     args = parser.parse_args()
  
     # environment
-    env = gym.make("Walker2d-v5")
+    env = gym.make("Walker2d-v5", render_mode="rgb_array") if args.test else gym.make("Walker2d-v5")
     seed = args.seed
     random.seed(seed)
     np.random.seed(seed)
     seed_torch(seed)
-    wandb.init(project="DLP-Lab7-PPO-Walker", name=args.wandb_run_name, save_code=True)
-    
-    agent = PPOAgent(env, args)
-    agent.train()
+
+    if args.test and args.load_ckpt is not None:
+        agent = PPOAgent(env, args)
+        ckpt = torch.load(args.load_ckpt, map_location=agent.device)
+        agent.actor.load_state_dict(ckpt['actor_state_dict'])
+        agent.critic.load_state_dict(ckpt['critic_state_dict'])
+        env_step = args.load_ckpt.split('/')[2].split('.')[0].split('_')[2]
+        agent.test(args.video_dir, env_step)
+    else:
+        wandb.init(project="DLP-Lab7-PPO-Walker", name=args.wandb_run_name, save_code=True)
+        
+        agent = PPOAgent(env, args)
+        agent.train()
