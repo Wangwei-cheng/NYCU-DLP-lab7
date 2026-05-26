@@ -11,6 +11,9 @@ python a2c_pendulum-2.py --lra
 python a2c_pendulum-2.py --actor-lr 5e-4 --critic-lr 5e-3 --entropy-weight 1e-3 --num-episodes 1500
 python a2c_pendulum-2.py --actor-lr 5e-4 --critic-lr 5e-3 --ewd --num-episodes 1500
 python a2c_pendulum-2.py --actor-lr 5e-4 --critic-lr 5e-3 --ewd --ew-min 5e-3 --num-episodes 1500
+python a2c_pendulum-2.py --ew-min 0.0005 --ewd
+python a2c_pendulum-2.py --ew-min 0.0005 --ewd --lra
+
 
 # a2c testing
 python a2c_pendulum-2.py --test --load-ckpt ./checkpoints/a2c_actor_200k.pt

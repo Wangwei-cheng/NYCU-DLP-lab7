@@ -36,39 +36,52 @@ class Actor(nn.Module):
         ############TODO#############
         # Remeber to initialize the layer weights
         self.hidden1 = nn.Linear(in_dim, 256)
-        self.hidden2 = nn.Linear(256, 512)
-        self.hidden3 = nn.Linear(512, 256)
+        self.hidden2 = nn.Linear(256, 256)
+        # self.hidden3 = nn.Linear(256, 128)
         self.mu_layer = nn.Linear(256, out_dim)
         self.log_std_layer = nn.Linear(256, out_dim)
-        self.log_std_min, self.log_std_max = -20, 2
+        self.log_std_min, self.log_std_max = -5, -1
 
-        initialize_uniformly(self.hidden1)
-        initialize_uniformly(self.hidden2)
-        initialize_uniformly(self.hidden3)
+        # initialize_uniformly(self.hidden1)
+        # initialize_uniformly(self.hidden2)
+        # initialize_uniformly(self.hidden3)
         initialize_uniformly(self.mu_layer)
         initialize_uniformly(self.log_std_layer)
         #############################
         
-    def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, Normal]:
+    def forward(self, state: torch.Tensor, deterministic: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward method implementation."""
 
         ############TODO#############
         x = F.relu(self.hidden1(state))
         x = F.relu(self.hidden2(x))
-        x = F.relu(self.hidden3(x))
+        # x = F.relu(self.hidden3(x))
 
-        mu = torch.tanh(self.mu_layer(x)) * 2.0
+        mu = self.mu_layer(x)
         log_std = self.log_std_layer(x)
         
         # Clamp log_std to prevent NaN and ensure numerical stability
         log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
-        std = torch.exp(log_std) + 1e-5
+        std = torch.exp(log_std)
         
         dist = Normal(mu, std)
-        action = dist.sample()
+        if deterministic:
+            raw_action = mu
+        else:
+            raw_action = dist.rsample()
+
+        action = torch.tanh(raw_action) * 2.0 # scale to [-2, 2]
+
+        log_prob = dist.log_prob(raw_action)
+        log_prob -= torch.log(
+            2.0 * (1 - torch.tanh(raw_action).pow(2) + 1e-6)
+        ) # correction for Tanh squashing
+        log_prob = log_prob.sum(dim=-1)
+
+        entropy = dist.entropy().sum(dim=-1)
         #############################
 
-        return action, dist
+        return action, log_prob, entropy
 
 
 class Critic(nn.Module):
@@ -78,14 +91,14 @@ class Critic(nn.Module):
         
         ############TODO#############
         # Remeber to initialize the layer weights
-        self.hidden1 = nn.Linear(in_dim, 512)
-        self.hidden2 = nn.Linear(512, 512)
-        self.hidden3 = nn.Linear(512, 256)
+        self.hidden1 = nn.Linear(in_dim, 256)
+        self.hidden2 = nn.Linear(256, 256)
+        # self.hidden3 = nn.Linear(256, 128)
         self.value_layer = nn.Linear(256, 1)
 
-        initialize_uniformly(self.hidden1)
-        initialize_uniformly(self.hidden2)
-        initialize_uniformly(self.hidden3)
+        # initialize_uniformly(self.hidden1)
+        # initialize_uniformly(self.hidden2)
+        # initialize_uniformly(self.hidden3)
         initialize_uniformly(self.value_layer)
         #############################
 
@@ -95,7 +108,7 @@ class Critic(nn.Module):
         ############TODO#############
         x = F.relu(self.hidden1(state))
         x = F.relu(self.hidden2(x))
-        x = F.relu(self.hidden3(x))
+        # x = F.relu(self.hidden3(x))
         value = self.value_layer(x)
         #############################
 
@@ -156,10 +169,10 @@ class A2CAgent:
         # schedulers
         if self.lr_annealing:
             self.actor_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                self.actor_optimizer, T_max=self.num_episodes, eta_min=self.actor_lr * 0.01
+                self.actor_optimizer, T_max=self.num_episodes, eta_min=self.actor_lr * 0.1
             )
             self.critic_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                self.critic_optimizer, T_max=self.num_episodes, eta_min=self.critic_lr * 0.01
+                self.critic_optimizer, T_max=self.num_episodes, eta_min=self.critic_lr * 0.1
             )
 
         # transition (state, log_prob, next_state, reward, done)
@@ -174,14 +187,15 @@ class A2CAgent:
     def select_action(self, state: np.ndarray) -> np.ndarray:
         """Select an action from the input state."""
         state = torch.FloatTensor(state).to(self.device)
-        action, dist = self.actor(state)
-        selected_action = dist.mean if self.is_test else action
-
+        action, log_prob, entropy = self.actor(
+            state,
+            deterministic=self.is_test
+        )
+        
         if not self.is_test:
-            log_prob = dist.log_prob(selected_action).sum(dim=-1)
-            self.transition = [state, log_prob]
+            self.transition = [state, log_prob, entropy]
 
-        return selected_action.clamp(-2.0, 2.0).cpu().detach().numpy()
+        return action.cpu().detach().numpy()
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, np.float64, bool]:
         """Take an action and return the response of the env."""
@@ -196,7 +210,7 @@ class A2CAgent:
 
     def update_model(self) -> Tuple[torch.Tensor, torch.Tensor, float]:
         """Update the model by gradient descent."""
-        state, log_prob, next_state, reward, terminated = self.transition
+        state, log_prob, entropy, next_state, reward, terminated = self.transition
 
         # Q_t   = r + gamma * V(s_{t+1})  if state != Terminal
         #       = r                       otherwise
@@ -211,6 +225,7 @@ class A2CAgent:
         # In Pendulum, we only set value to 0 if terminated (which never happens in normal play).
         # If truncated (time out at 200 steps), we MUST bootstrap the value of the next state.
         
+        reward = reward * 0.1 # reward scaling
         target = reward + self.gamma * next_value * mask
         current_value = self.critic(state)
         value_loss = F.mse_loss(current_value, target.detach())
@@ -227,11 +242,7 @@ class A2CAgent:
         # policy_loss = ?
         advantage = target.detach() - current_value.detach()
         
-        # Calculate entropy for exploration
-        _, dist = self.actor(state)
-        entropy = dist.entropy().sum(dim=-1, keepdim=True).mean()
-        
-        policy_loss = - (log_prob * advantage + self.entropy_weight * entropy)
+        policy_loss = - (log_prob * advantage + self.entropy_weight * entropy).mean()
         #############################
         # update policy
         self.actor_optimizer.zero_grad()
@@ -239,7 +250,7 @@ class A2CAgent:
         nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=0.5)
         self.actor_optimizer.step()
 
-        return policy_loss.item(), value_loss.item(), entropy
+        return policy_loss.item(), value_loss.item(), entropy.item()
 
     def train(self):
         """Train the agent."""
@@ -304,7 +315,7 @@ class A2CAgent:
                 eval_score = self.evaluate()
                 wandb.log({"eval_return": eval_score}, step=step_count)
                 tqdm.write(f"--- Evaluation at Episode {ep}: Average Reward = {eval_score} ---")
-                if eval_score > best_score and eval_score >= -300.0:
+                if eval_score > best_score and eval_score >= -200.0:
                     best_score = eval_score
                     path = os.path.join(self.ckpt_dir, f"step_{step_count}_score_{eval_score}.pt")
                     torch.save({
